@@ -36,8 +36,20 @@ const major = (v) => Number(v || 0) / 100;
 const euro = (v) => `€${major(v).toLocaleString('en-IE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fmtDate = (v) => {
   if (!v) return '—';
-  const d = new Date(`${String(v).slice(0,10)}T12:00:00`);
-  return Number.isNaN(d.getTime()) ? esc(v) : d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+
+  // PostgreSQL DATE values may arrive as either YYYY-MM-DD strings or JS Date objects.
+  // Always show invoice dates as date-only DD/MM/YYYY — never time/timezone text.
+  const raw = String(v);
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`;
+
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return esc(raw);
+
+  const dd = String(d.getUTCDate()).padStart(2,'0');
+  const mm = String(d.getUTCMonth()+1).padStart(2,'0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
 };
 const iso = (v) => v ? String(v).slice(0,10) : '';
 
