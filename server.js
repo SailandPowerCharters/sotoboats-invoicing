@@ -101,9 +101,20 @@ function calculateLine(quantity, unitPrice, taxRate) {
 async function loadInvoice(id) {
   const tenant = await getTenant();
   const invoice = (await pool.query(`
-    SELECT i.*, c.contact_name,c.company_name,c.email,c.phone,c.billing_address_1,c.billing_address_2,
-           c.billing_city,c.billing_region,c.billing_postcode,c.billing_country_code,c.tax_number,
-           c.identity_type,c.identity_number
+    SELECT i.*,
+           COALESCE(i.snapshot_contact_name,c.contact_name) AS contact_name,
+           COALESCE(i.snapshot_company_name,c.company_name) AS company_name,
+           COALESCE(i.snapshot_email,c.email) AS email,
+           COALESCE(i.snapshot_phone,c.phone) AS phone,
+           COALESCE(i.snapshot_billing_address_1,c.billing_address_1) AS billing_address_1,
+           COALESCE(i.snapshot_billing_address_2,c.billing_address_2) AS billing_address_2,
+           COALESCE(i.snapshot_billing_city,c.billing_city) AS billing_city,
+           COALESCE(i.snapshot_billing_region,c.billing_region) AS billing_region,
+           COALESCE(i.snapshot_billing_postcode,c.billing_postcode) AS billing_postcode,
+           COALESCE(i.snapshot_billing_country_code,c.billing_country_code) AS billing_country_code,
+           COALESCE(i.snapshot_tax_number,c.tax_number) AS tax_number,
+           COALESCE(i.snapshot_identity_type,c.identity_type) AS identity_type,
+           COALESCE(i.snapshot_identity_number,c.identity_number) AS identity_number
     FROM customer_invoices i
     JOIN invoice_customers c ON c.id=i.customer_id
     WHERE i.id=$1 AND i.tenant_id=$2
@@ -195,17 +206,279 @@ app.get('/', async (req,res)=>{
   res.send(shell('Invoice Dashboard','dashboard',content,'Dave’s live test of the future YDP invoicing engine.'));
 });
 
+function customerForm(c={}, action='/customers', heading='New customer') {
+  return `<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${esc(heading)}</h2><p class="sub">Draft invoices use the live customer record. Issued invoices keep the customer details that were present when issued.</p></div>${c.id?'<a class="btn light" href="/customers">Back to customers</a>':''}</div>
+  <form method="post" action="${action}"><div class="form-grid">
+    <label>Customer type<select name="customer_type"><option value="individual" ${c.customer_type!=='business'?'selected':''}>Individual</option><option value="business" ${c.customer_type==='business'?'selected':''}>Business</option></select></label>
+    <label>Contact name<input name="contact_name" value="${esc(c.contact_name||'')}" required></label>
+    <label>Company name<input name="company_name" value="${esc(c.company_name||'')}"></label>
+    <label>Email<input type="email" name="email" value="${esc(c.email||'')}"></label>
+    <label>Phone<input name="phone" value="${esc(c.phone||'')}"></label>
+    <label>Tax / VAT number<input name="tax_number" value="${esc(c.tax_number||'')}"></label>
+    <label>Address<input name="billing_address_1" value="${esc(c.billing_address_1||'')}"></label>
+    <label>Address line 2<input name="billing_address_2" value="${esc(c.billing_address_2||'')}"></label>
+    <label>Town / City<input name="billing_city" value="${esc(c.billing_city||'')}"></label>
+    <label>Region<input name="billing_region" value="${esc(c.billing_region||'')}"></label>
+    <label>Postcode<input name="billing_postcode" value="${esc(c.billing_postcode||'')}"></label>
+    <label>Country code<input name="billing_country_code" value="${esc(c.billing_country_code||'ES')}" maxlength="2"></label>
+    <label>Passport / ID type<input name="identity_type" value="${esc(c.identity_type||'')}" placeholder="Optional"></label>
+    <label>Passport / ID number<input name="identity_number" value="${esc(c.identity_number||'')}" placeholder="Optional"></label>
+    <label class="full">Internal notes<textarea name="notes">${esc(c.notes||'')}</textarea></label>
+  </div><div class="actions"><button class="btn gold">Save customer</button></div></form></section>`;
+}
+
+function customerValues(b){
+  return [
+    b.customer_type||'individual',
+    b.company_name||null,
+    b.contact_name,
+    b.email||null,
+    b.phone||null,
+    b.billing_address_1||null,
+    b.billing_address_2||null,
+    b.billing_city||null,
+    b.billing_region||null,
+    b.billing_postcode||null,
+    (b.billing_country_code||'ES').toUpperCase().slice(0,2),
+    b.tax_number||null,
+    b.identity_type||null,
+    b.identity_number||null,
+    b.notes||null
+  ];
+}
+
 app.get('/customers',async(req,res)=>{
   const tenant=await getTenant();
   const rows=(await pool.query(`SELECT * FROM invoice_customers WHERE tenant_id=$1 AND is_active=true ORDER BY COALESCE(company_name,contact_name),contact_name`,[tenant.id])).rows;
-  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Customer</th><th>Contact</th><th>Billing</th><th>Tax / ID</th></tr></thead><tbody>${rows.map(r=>`<tr><td><strong>${esc(r.company_name||r.contact_name)}</strong>${r.company_name?`<br><span class="muted">${esc(r.contact_name)}</span>`:''}</td><td>${esc(r.email||'—')}<br><span class="muted">${esc(r.phone||'')}</span></td><td>${esc([r.billing_address_1,r.billing_city,r.billing_postcode].filter(Boolean).join(', ')||'—')}</td><td>${esc(r.tax_number||'—')}${r.identity_number?`<br><span class="muted">${esc(r.identity_type||'ID')}: ••••${esc(String(r.identity_number).slice(-4))}</span>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No customers yet.</p>';
-  const content=`<section class="form-card"><h2>Add customer</h2><form method="post" action="/customers"><div class="form-grid"><label>Customer type<select name="customer_type"><option value="individual">Individual</option><option value="business">Business</option></select></label><label>Contact name<input name="contact_name" required></label><label>Company name<input name="company_name"></label><label>Email<input type="email" name="email"></label><label>Phone<input name="phone"></label><label>Tax / VAT number<input name="tax_number"></label><label>Address<input name="billing_address_1"></label><label>Address line 2<input name="billing_address_2"></label><label>Town / City<input name="billing_city"></label><label>Region<input name="billing_region"></label><label>Postcode<input name="billing_postcode"></label><label>Country code<input name="billing_country_code" value="ES" maxlength="2"></label><label>Passport / ID type<input name="identity_type" placeholder="Optional"></label><label>Passport / ID number<input name="identity_number" placeholder="Optional"></label><label class="full">Internal notes<textarea name="notes"></textarea></label></div><div class="actions"><button class="btn gold">Save customer</button></div></form></section><section class="card"><h2>Customers</h2>${table}</section>`;
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Customer</th><th>Email</th><th>Phone</th><th>Address</th><th>Tax / ID</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td><strong>${esc(r.company_name||r.contact_name)}</strong>${r.company_name?`<br><span class="muted">${esc(r.contact_name||'')}</span>`:''}</td><td>${esc(r.email||'—')}</td><td>${esc(r.phone||'—')}</td><td>${esc([r.billing_address_1,r.billing_city,r.billing_postcode].filter(Boolean).join(', ')||'—')}</td><td>${esc(r.tax_number||r.identity_number||'—')}</td><td><a class="btn light" href="/customers/${r.id}/edit">Edit</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No customers yet.</p>';
+  const content=`
+    <div class="actions" style="margin-bottom:14px"><a class="btn gold" href="#new">Add customer</a><a class="btn light" href="/customers/import">Import CSV</a><a class="btn light" href="/customers/template.csv">Download CSV template</a></div>
+    <section id="new">${customerForm({},'/customers','New customer')}</section>
+    <section class="card"><h2>Customers</h2>${table}</section>`;
   res.send(shell('Customers','customers',content,'Reusable customer records for future invoices.'));
 });
+
 app.post('/customers',async(req,res)=>{
-  const tenant=await getTenant(); const b=req.body;
-  await pool.query(`INSERT INTO invoice_customers(tenant_id,customer_type,company_name,contact_name,email,phone,billing_address_1,billing_address_2,billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,identity_number,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,[tenant.id,b.customer_type||'individual',b.company_name||null,b.contact_name,b.email||null,b.phone||null,b.billing_address_1||null,b.billing_address_2||null,b.billing_city||null,b.billing_region||null,b.billing_postcode||null,(b.billing_country_code||'ES').toUpperCase().slice(0,2),b.tax_number||null,b.identity_type||null,b.identity_number||null,b.notes||null]);
+  const tenant=await getTenant();
+  const b=req.body;
+  if(!String(b.contact_name||'').trim()) return res.status(400).send('Contact name is required.');
+  const v=customerValues(b);
+  await pool.query(`
+    INSERT INTO invoice_customers(
+      tenant_id,customer_type,company_name,contact_name,email,phone,billing_address_1,billing_address_2,
+      billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,identity_number,notes
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+  `,[tenant.id,...v]);
   res.redirect('/customers');
+});
+
+app.get('/customers/:id/edit',async(req,res)=>{
+  const tenant=await getTenant();
+  const c=(await pool.query(`SELECT * FROM invoice_customers WHERE id=$1 AND tenant_id=$2 AND is_active=true`,[req.params.id,tenant.id])).rows[0];
+  if(!c) return res.status(404).send('Customer not found.');
+  res.send(shell('Edit Customer','customers',customerForm(c,`/customers/${c.id}/edit`,'Edit customer'),'Changes flow through to draft invoices only. Issued invoices remain unchanged.'));
+});
+
+app.post('/customers/:id/edit',async(req,res)=>{
+  const tenant=await getTenant();
+  const b=req.body;
+  if(!String(b.contact_name||'').trim()) return res.status(400).send('Contact name is required.');
+  const v=customerValues(b);
+  await pool.query(`
+    UPDATE invoice_customers SET
+      customer_type=$1,company_name=$2,contact_name=$3,email=$4,phone=$5,
+      billing_address_1=$6,billing_address_2=$7,billing_city=$8,billing_region=$9,
+      billing_postcode=$10,billing_country_code=$11,tax_number=$12,identity_type=$13,
+      identity_number=$14,notes=$15,updated_at=now()
+    WHERE id=$16 AND tenant_id=$17
+  `,[...v,req.params.id,tenant.id]);
+  res.redirect('/customers');
+});
+
+app.get('/customers/template.csv',(req,res)=>{
+  const csv=[
+    'Customer Type,Contact Name,Company Name,Email,Phone,Address 1,Address 2,City,Region,Postcode,Country Code,Tax VAT Number,ID Type,ID Number,Notes',
+    'individual,Jane Example,,jane@example.com,+34600000000,Calle Example 1,,Estepona,Málaga,29680,ES,,Passport,123456789,'
+  ].join('\\n');
+  res.type('text/csv');
+  res.setHeader('Content-Disposition','attachment; filename="Sotoboats-Customer-Import-Template.csv"');
+  res.send(csv);
+});
+
+app.get('/customers/import',async(req,res)=>{
+  const content=`<section class="card">
+    <h2>Import customers from CSV</h2>
+    <p class="sub">Upload a CSV, map its columns to customer fields, preview the data, then import. Nothing is added until you press Import customers.</p>
+    <div class="form-grid" style="margin-top:16px">
+      <label>CSV file<input id="csvFile" type="file" accept=".csv,text/csv"></label>
+      <label>Duplicates<select id="duplicateMode"><option value="skip">Skip matching email / phone</option><option value="update">Update matching email / phone</option><option value="new">Always import as new</option></select></label>
+    </div>
+    <div id="mappingArea" style="margin-top:18px"></div>
+    <div id="previewArea" style="margin-top:18px"></div>
+    <div class="actions"><button id="importBtn" class="btn gold" type="button" disabled>Import customers</button><a class="btn light" href="/customers/template.csv">Download template</a><a class="btn light" href="/customers">Cancel</a></div>
+    <div id="importResult" style="margin-top:14px"></div>
+  </section>
+  <script>
+  (function(){
+    const fieldOptions=[
+      ['','Do not import'],['customer_type','Customer Type'],['contact_name','Contact Name'],['company_name','Company Name'],
+      ['email','Email'],['phone','Phone'],['billing_address_1','Address 1'],['billing_address_2','Address 2'],
+      ['billing_city','City'],['billing_region','Region'],['billing_postcode','Postcode'],
+      ['billing_country_code','Country Code'],['tax_number','Tax / VAT Number'],['identity_type','ID Type'],
+      ['identity_number','ID Number'],['notes','Notes']
+    ];
+    const aliases={
+      'customer type':'customer_type','type':'customer_type','contact name':'contact_name','name':'contact_name',
+      'customer name':'contact_name','company name':'company_name','company':'company_name','email':'email',
+      'email address':'email','phone':'phone','telephone':'phone','mobile':'phone','address 1':'billing_address_1',
+      'address':'billing_address_1','address line 1':'billing_address_1','address 2':'billing_address_2',
+      'address line 2':'billing_address_2','city':'billing_city','town':'billing_city','region':'billing_region',
+      'province':'billing_region','postcode':'billing_postcode','postal code':'billing_postcode','zip':'billing_postcode',
+      'country code':'billing_country_code','country':'billing_country_code','tax vat number':'tax_number',
+      'tax number':'tax_number','vat number':'tax_number','id type':'identity_type','passport id type':'identity_type',
+      'id number':'identity_number','passport number':'identity_number','passport id number':'identity_number','notes':'notes'
+    };
+    let matrix=[],headers=[];
+
+    function parseCSV(text){
+      const rows=[]; let row=[],cell='',quoted=false;
+      for(let i=0;i<text.length;i++){
+        const ch=text[i], next=text[i+1];
+        if(ch==='"'){
+          if(quoted && next==='"'){cell+='"';i++;}
+          else quoted=!quoted;
+        }else if(ch===',' && !quoted){row.push(cell);cell='';}
+        else if((ch==='\\n'||ch==='\\r') && !quoted){
+          if(ch==='\\r'&&next==='\\n') i++;
+          row.push(cell);cell='';
+          if(row.some(v=>String(v).trim()!=='')) rows.push(row);
+          row=[];
+        }else cell+=ch;
+      }
+      row.push(cell);
+      if(row.some(v=>String(v).trim()!=='')) rows.push(row);
+      return rows;
+    }
+    function norm(v){return String(v||'').trim().toLowerCase().replace(/[_-]+/g,' ').replace(/\\s+/g,' ');}
+    function renderMapping(){
+      const html='<h3>Map columns</h3><div class="table-wrap"><table><thead><tr><th>CSV column</th><th>Import as</th><th>Example</th></tr></thead><tbody>'+
+      headers.map((h,i)=>{
+        const guess=aliases[norm(h)]||'';
+        return '<tr><td><strong>'+escapeHtml(h)+'</strong></td><td><select class="mapSelect" data-index="'+i+'">'+
+          fieldOptions.map(o=>'<option value="'+o[0]+'" '+(o[0]===guess?'selected':'')+'>'+o[1]+'</option>').join('')+
+          '</select></td><td>'+escapeHtml((matrix[1]&&matrix[1][i])||'')+'</td></tr>';
+      }).join('')+'</tbody></table></div>';
+      document.getElementById('mappingArea').innerHTML=html;
+      document.querySelectorAll('.mapSelect').forEach(s=>s.addEventListener('change',renderPreview));
+      renderPreview();
+    }
+    function mappedRows(){
+      const maps=Array.from(document.querySelectorAll('.mapSelect')).map(s=>s.value);
+      return matrix.slice(1).map(r=>{
+        const o={};
+        maps.forEach((field,i)=>{if(field)o[field]=String(r[i]||'').trim();});
+        if(o.billing_country_code && o.billing_country_code.length>2){
+          const c=o.billing_country_code.toLowerCase();
+          if(c==='spain'||c==='españa') o.billing_country_code='ES';
+          else if(c==='united kingdom'||c==='uk'||c==='great britain') o.billing_country_code='GB';
+        }
+        return o;
+      }).filter(o=>Object.values(o).some(v=>v));
+    }
+    function renderPreview(){
+      const rows=mappedRows();
+      const first=rows.slice(0,8);
+      document.getElementById('previewArea').innerHTML='<h3>Preview</h3><p class="sub">'+rows.length+' row(s) ready to import.</p>'+
+        (first.length?'<div class="table-wrap"><table><thead><tr><th>Name</th><th>Company</th><th>Email</th><th>Phone</th><th>City</th></tr></thead><tbody>'+
+        first.map(r=>'<tr><td>'+escapeHtml(r.contact_name||'')+'</td><td>'+escapeHtml(r.company_name||'')+'</td><td>'+escapeHtml(r.email||'')+'</td><td>'+escapeHtml(r.phone||'')+'</td><td>'+escapeHtml(r.billing_city||'')+'</td></tr>').join('')+
+        '</tbody></table></div>':'');
+      document.getElementById('importBtn').disabled=!rows.length;
+    }
+    function escapeHtml(v){return String(v||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c];});}
+
+    document.getElementById('csvFile').addEventListener('change',function(){
+      const file=this.files[0]; if(!file)return;
+      const reader=new FileReader();
+      reader.onload=function(){
+        matrix=parseCSV(String(reader.result||'').replace(/^\\uFEFF/,''));
+        if(matrix.length<2){document.getElementById('mappingArea').innerHTML='<div class="error">No data rows found.</div>';return;}
+        headers=matrix[0].map(v=>String(v||'').trim());
+        renderMapping();
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById('importBtn').addEventListener('click',async function(){
+      const rows=mappedRows();
+      if(!rows.length)return;
+      if(rows.some(r=>!r.contact_name)){
+        document.getElementById('importResult').innerHTML='<div class="error">Every imported row needs a Contact Name. Map a name column before importing.</div>';
+        return;
+      }
+      this.disabled=true; this.textContent='Importing…';
+      try{
+        const response=await fetch('/customers/import',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({rows:rows,duplicate_mode:document.getElementById('duplicateMode').value})
+        });
+        const data=await response.json();
+        if(!response.ok) throw new Error(data.error||'Import failed');
+        document.getElementById('importResult').innerHTML='<div class="card" style="background:#f2fbef"><strong>Import complete</strong><p class="sub">'+data.imported+' imported · '+data.updated+' updated · '+data.skipped+' skipped · '+data.errors+' errors</p></div>';
+      }catch(err){
+        document.getElementById('importResult').innerHTML='<div class="error">'+escapeHtml(err.message)+'</div>';
+      }finally{
+        this.disabled=false; this.textContent='Import customers';
+      }
+    });
+  })();
+  </script>`;
+  res.send(shell('Import Customers','customers',content,'Bring existing customer records into Sotoboats invoicing.'));
+});
+
+app.post('/customers/import',async(req,res)=>{
+  const tenant=await getTenant();
+  const rows=Array.isArray(req.body.rows)?req.body.rows:[];
+  const mode=req.body.duplicate_mode||'skip';
+  let imported=0,updated=0,skipped=0,errors=0;
+
+  for(const raw of rows){
+    const b=raw||{};
+    if(!String(b.contact_name||'').trim()){errors++;continue;}
+    try{
+      let existing=null;
+      if(mode!=='new' && b.email){
+        existing=(await pool.query(`SELECT * FROM invoice_customers WHERE tenant_id=$1 AND LOWER(email)=LOWER($2) AND is_active=true LIMIT 1`,[tenant.id,b.email])).rows[0]||null;
+      }
+      if(!existing && mode!=='new' && b.phone){
+        existing=(await pool.query(`SELECT * FROM invoice_customers WHERE tenant_id=$1 AND phone=$2 AND is_active=true LIMIT 1`,[tenant.id,b.phone])).rows[0]||null;
+      }
+      if(existing && mode==='skip'){skipped++;continue;}
+
+      const v=customerValues(b);
+      if(existing && mode==='update'){
+        await pool.query(`
+          UPDATE invoice_customers SET customer_type=$1,company_name=$2,contact_name=$3,email=$4,phone=$5,
+          billing_address_1=$6,billing_address_2=$7,billing_city=$8,billing_region=$9,billing_postcode=$10,
+          billing_country_code=$11,tax_number=$12,identity_type=$13,identity_number=$14,notes=$15,updated_at=now()
+          WHERE id=$16 AND tenant_id=$17
+        `,[...v,existing.id,tenant.id]);
+        updated++;
+      }else{
+        await pool.query(`
+          INSERT INTO invoice_customers(
+            tenant_id,customer_type,company_name,contact_name,email,phone,billing_address_1,billing_address_2,
+            billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,identity_number,notes
+          ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        `,[tenant.id,...v]);
+        imported++;
+      }
+    }catch(err){
+      console.error('Customer import row failed',err);
+      errors++;
+    }
+  }
+  res.json({ok:true,imported,updated,skipped,errors});
 });
 
 app.get('/invoices',async(req,res)=>{
@@ -252,7 +525,7 @@ async function invoiceForm(res, invoice=null, items=[]) {
   const defaultDue=new Date(Date.now()+tenant.payment_terms_days*86400000).toISOString().slice(0,10);
   const dueDate=iso(invoice?.due_date)||defaultDue;
   const action=edit?`/invoices/${invoice.id}/edit`:'/invoices/new';
-  const content=`<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${edit?'Edit draft':'New invoice'}</h2><p class="sub">Invoice numbers are allocated only when you issue the invoice.</p></div>${edit?`<a class="btn light" href="/invoices/${invoice.id}">Back to invoice</a>`:''}</div><form method="post" action="${action}" id="invoiceForm"><div class="form-grid three"><label>Customer<select name="customer_id" required><option value="">Choose customer</option>${customers.map(c=>`<option value="${c.id}" ${invoice?.customer_id===c.id?'selected':''}>${esc(c.company_name||c.contact_name)}</option>`).join('')}</select></label><label>Invoice language<select name="invoice_language"><option value="bilingual" ${invoice?.invoice_language==='bilingual'||!invoice?'selected':''}>Bilingual</option><option value="en" ${invoice?.invoice_language==='en'?'selected':''}>English</option><option value="es" ${invoice?.invoice_language==='es'?'selected':''}>Spanish</option></select></label><label>Booking reference<input name="booking_reference" value="${esc(invoice?.booking_reference||'')}"></label><label>Service / course title<input name="service_title" value="${esc(invoice?.service_title||'')}" placeholder="e.g. Private Sailing Tuition" required></label><label>Start date<input id="serviceStart" type="date" name="service_start_date" value="${iso(invoice?.service_start_date)}"></label><label>End date<input type="date" name="service_end_date" value="${iso(invoice?.service_end_date)}"></label><label>Issue date<input type="date" name="issue_date" value="${issueDate}"></label><label>Due date<input type="date" name="due_date" value="${dueDate}"></label><label>Payment due now<select id="paymentMode" name="payment_mode"><option value="auto" ${invoice?.payment_mode==='auto'||!invoice?'selected':''}>Auto from booking date</option><option value="full" ${invoice?.payment_mode==='full'?'selected':''}>Full balance</option><option value="deposit" ${invoice?.payment_mode==='deposit'?'selected':''}>25% deposit</option><option value="custom" ${invoice?.payment_mode==='custom'?'selected':''}>Custom amount</option></select></label><label id="customDueWrap" class="${invoice?.payment_mode==='custom'?'':'hide'}">Custom amount due €<input id="customDue" type="number" step="0.01" min="0" name="custom_amount_due" value="${invoice?.payment_mode==='custom'&&invoice.amount_due_now_minor!=null?major(invoice.amount_due_now_minor).toFixed(2):''}"></label><label>Customer reference<input name="customer_reference" value="${esc(invoice?.customer_reference||'')}"></label><label>Bank transfer<select name="bank_transfer_enabled"><option value="1" ${invoice?.bank_transfer_enabled!==false?'selected':''}>Enabled</option><option value="0" ${invoice?.bank_transfer_enabled===false?'selected':''}>Disabled</option></select></label></div><div class="card" style="margin-top:16px;background:#fbfcfc"><h2>Invoice lines</h2><div id="lineRows">${lineRowsHtml(items)}</div><div class="actions" style="margin-top:10px"><button class="btn light" type="button" id="addLine">+ Add line</button></div><div class="totals"><div class="totals-row"><span>Net</span><strong id="calcNet">€0.00</strong></div><div class="totals-row"><span>VAT</span><strong id="calcVat">€0.00</strong></div><div class="totals-row total"><span>Total</span><strong id="calcTotal">€0.00</strong></div><div class="totals-row"><span>Due now</span><strong id="calcDue">€0.00</strong></div></div></div><div class="form-grid"><label class="full">Customer notes<textarea name="customer_notes">${esc(invoice?.customer_notes||'')}</textarea></label><label class="full">Internal notes<textarea name="internal_notes">${esc(invoice?.internal_notes||'')}</textarea></label></div><div class="notice" id="depositNotice" style="margin-top:12px">The automatic rule uses Sotoboats' current terms: 25% deposit when the start date is more than 30 days away; otherwise full payment is due.</div><div class="actions" style="margin-top:14px"><button class="btn gold">${edit?'Save draft changes':'Save draft'}</button></div></form></section><script>
+  const content=`<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${edit?'Edit draft':'New invoice'}</h2><p class="sub">Invoice numbers are allocated only when you issue the invoice.</p></div>${edit?`<a class="btn light" href="/invoices/${invoice.id}">Back to invoice</a>`:''}</div><form method="post" action="${action}" id="invoiceForm"><div class="form-grid three"><label>Customer<select name="customer_id" id="invoiceCustomer" required><option value="">Choose customer</option>${customers.map(c=>`<option value="${c.id}" ${invoice?.customer_id===c.id?'selected':''}>${esc(c.company_name||c.contact_name)}</option>`).join('')}</select><a id="editInvoiceCustomer" href="${invoice?.customer_id?`/customers/${invoice.customer_id}/edit`:''}" target="_blank" style="font-size:9px;margin-top:4px;${invoice?.customer_id?'':'display:none'}">Edit selected customer ↗</a></label><label>Invoice language<select name="invoice_language"><option value="bilingual" ${invoice?.invoice_language==='bilingual'||!invoice?'selected':''}>Bilingual</option><option value="en" ${invoice?.invoice_language==='en'?'selected':''}>English</option><option value="es" ${invoice?.invoice_language==='es'?'selected':''}>Spanish</option></select></label><label>Booking reference<input name="booking_reference" value="${esc(invoice?.booking_reference||'')}"></label><label>Service / course title<input name="service_title" value="${esc(invoice?.service_title||'')}" placeholder="e.g. Private Sailing Tuition" required></label><label>Start date<input id="serviceStart" type="date" name="service_start_date" value="${iso(invoice?.service_start_date)}"></label><label>End date<input type="date" name="service_end_date" value="${iso(invoice?.service_end_date)}"></label><label>Issue date<input type="date" name="issue_date" value="${issueDate}"></label><label>Due date<input type="date" name="due_date" value="${dueDate}"></label><label>Payment due now<select id="paymentMode" name="payment_mode"><option value="auto" ${invoice?.payment_mode==='auto'||!invoice?'selected':''}>Auto from booking date</option><option value="full" ${invoice?.payment_mode==='full'?'selected':''}>Full balance</option><option value="deposit" ${invoice?.payment_mode==='deposit'?'selected':''}>25% deposit</option><option value="custom" ${invoice?.payment_mode==='custom'?'selected':''}>Custom amount</option></select></label><label id="customDueWrap" class="${invoice?.payment_mode==='custom'?'':'hide'}">Custom amount due €<input id="customDue" type="number" step="0.01" min="0" name="custom_amount_due" value="${invoice?.payment_mode==='custom'&&invoice.amount_due_now_minor!=null?major(invoice.amount_due_now_minor).toFixed(2):''}"></label><label>Customer reference<input name="customer_reference" value="${esc(invoice?.customer_reference||'')}"></label><label>Bank transfer<select name="bank_transfer_enabled"><option value="1" ${invoice?.bank_transfer_enabled!==false?'selected':''}>Enabled</option><option value="0" ${invoice?.bank_transfer_enabled===false?'selected':''}>Disabled</option></select></label></div><div class="card" style="margin-top:16px;background:#fbfcfc"><h2>Invoice lines</h2><div id="lineRows">${lineRowsHtml(items)}</div><div class="actions" style="margin-top:10px"><button class="btn light" type="button" id="addLine">+ Add line</button></div><div class="totals"><div class="totals-row"><span>Net</span><strong id="calcNet">€0.00</strong></div><div class="totals-row"><span>VAT</span><strong id="calcVat">€0.00</strong></div><div class="totals-row total"><span>Total</span><strong id="calcTotal">€0.00</strong></div><div class="totals-row"><span>Due now</span><strong id="calcDue">€0.00</strong></div></div></div><div class="form-grid"><label class="full">Customer notes<textarea name="customer_notes">${esc(invoice?.customer_notes||'')}</textarea></label><label class="full">Internal notes<textarea name="internal_notes">${esc(invoice?.internal_notes||'')}</textarea></label></div><div class="notice" id="depositNotice" style="margin-top:12px">The automatic rule uses Sotoboats' current terms: 25% deposit when the start date is more than 30 days away; otherwise full payment is due.</div><div class="actions" style="margin-top:14px"><button class="btn gold">${edit?'Save draft changes':'Save draft'}</button></div></form></section><script>
   const depPct=${Number(tenant.deposit_percent)}; const threshold=${Number(tenant.deposit_threshold_days)};
   const descriptionPresets={
     tuition:{type:'hours',
@@ -374,6 +647,19 @@ async function invoiceForm(res, invoice=null, items=[]) {
     document.getElementById('calcVat').textContent='€'+vat.toFixed(2);
     document.getElementById('calcTotal').textContent='€'+total.toFixed(2);
     document.getElementById('calcDue').textContent='€'+Math.max(0,due).toFixed(2);
+  }
+
+  const customerSelect=document.getElementById('invoiceCustomer');
+  const editCustomerLink=document.getElementById('editInvoiceCustomer');
+  if(customerSelect&&editCustomerLink){
+    customerSelect.addEventListener('change',function(){
+      if(this.value){
+        editCustomerLink.href='/customers/'+this.value+'/edit';
+        editCustomerLink.style.display='inline-block';
+      }else{
+        editCustomerLink.style.display='none';
+      }
+    });
   }
 
   document.querySelectorAll('.line-row').forEach(wireLineRow);
@@ -607,7 +893,57 @@ app.get('/invoices/:id',async(req,res)=>{
 
 app.post('/invoices/:id/issue',async(req,res)=>{
   const client=await pool.connect();
-  try{await client.query('BEGIN');const tenant=await getTenant(client);const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];if(!i)throw new Error('Invoice not found.');if(i.locked_at)throw new Error('Invoice has already been issued.');const t=(await client.query(`SELECT * FROM invoice_tenants WHERE id=$1 FOR UPDATE`,[tenant.id])).rows[0];const number=`${t.invoice_prefix||''}${String(t.next_invoice_number).padStart(Number(t.invoice_padding||7),'0')}`;const issue=i.issue_date||new Date().toISOString().slice(0,10);let due=i.due_date;if(!due){const d=new Date(`${issue}T12:00:00`);d.setDate(d.getDate()+Number(t.payment_terms_days||5));due=d.toISOString().slice(0,10);}await client.query(`UPDATE customer_invoices SET invoice_number=$1,issue_date=$2,due_date=$3,status='sent',issued_at=now(),locked_at=now(),updated_at=now() WHERE id=$4`,[number,issue,due,i.id]);await client.query(`UPDATE invoice_tenants SET next_invoice_number=next_invoice_number+1,updated_at=now() WHERE id=$1`,[tenant.id]);await client.query(`INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details) VALUES($1,$2,'invoice_issued','Sotoboats Admin',jsonb_build_object('invoice_number',to_jsonb($3::text)))`,[tenant.id,i.id,number]);await client.query('COMMIT');res.redirect(`/invoices/${i.id}`);}catch(err){await client.query('ROLLBACK');res.status(400).send(esc(err.message));}finally{client.release();}
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];
+    if(!i) throw new Error('Invoice not found.');
+    if(i.locked_at) throw new Error('Invoice has already been issued.');
+
+    const customer=(await client.query(`SELECT * FROM invoice_customers WHERE id=$1 AND tenant_id=$2`,[i.customer_id,tenant.id])).rows[0];
+    if(!customer) throw new Error('Customer record not found.');
+
+    const t=(await client.query(`SELECT * FROM invoice_tenants WHERE id=$1 FOR UPDATE`,[tenant.id])).rows[0];
+    const number=`${t.invoice_prefix||''}${String(t.next_invoice_number).padStart(Number(t.invoice_padding||7),'0')}`;
+    const issue=i.issue_date||new Date().toISOString().slice(0,10);
+    let due=i.due_date;
+    if(!due){
+      const d=new Date(`${issue}T12:00:00`);
+      d.setDate(d.getDate()+Number(t.payment_terms_days||5));
+      due=d.toISOString().slice(0,10);
+    }
+
+    await client.query(`
+      UPDATE customer_invoices SET
+        invoice_number=$1,issue_date=$2,due_date=$3,status='sent',issued_at=now(),locked_at=now(),updated_at=now(),
+        snapshot_contact_name=$4,snapshot_company_name=$5,snapshot_email=$6,snapshot_phone=$7,
+        snapshot_billing_address_1=$8,snapshot_billing_address_2=$9,snapshot_billing_city=$10,
+        snapshot_billing_region=$11,snapshot_billing_postcode=$12,snapshot_billing_country_code=$13,
+        snapshot_tax_number=$14,snapshot_identity_type=$15,snapshot_identity_number=$16
+      WHERE id=$17
+    `,[
+      number,issue,due,
+      customer.contact_name||null,customer.company_name||null,customer.email||null,customer.phone||null,
+      customer.billing_address_1||null,customer.billing_address_2||null,customer.billing_city||null,
+      customer.billing_region||null,customer.billing_postcode||null,customer.billing_country_code||null,
+      customer.tax_number||null,customer.identity_type||null,customer.identity_number||null,
+      i.id
+    ]);
+
+    await client.query(`UPDATE invoice_tenants SET next_invoice_number=next_invoice_number+1,updated_at=now() WHERE id=$1`,[tenant.id]);
+    await client.query(
+      `INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+       VALUES($1,$2,'invoice_issued','Sotoboats Admin',jsonb_build_object('invoice_number',to_jsonb($3::text)))`,
+      [tenant.id,i.id,number]
+    );
+    await client.query('COMMIT');
+    res.redirect(`/invoices/${i.id}`);
+  }catch(err){
+    await client.query('ROLLBACK');
+    res.status(400).send(esc(err.message));
+  }finally{
+    client.release();
+  }
 });
 
 app.post('/invoices/:id/payments',async(req,res)=>{
@@ -703,7 +1039,20 @@ async function initialiseDatabase() {
   await pool.query(`
     ALTER TABLE customer_invoices
       ADD COLUMN IF NOT EXISTS emailed_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS emailed_to TEXT;
+      ADD COLUMN IF NOT EXISTS emailed_to TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_contact_name TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_company_name TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_email TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_phone TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_address_1 TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_address_2 TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_city TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_region TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_postcode TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_billing_country_code TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_tax_number TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_identity_type TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_identity_number TEXT;
   `);
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
