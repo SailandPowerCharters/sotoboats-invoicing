@@ -4,6 +4,7 @@ const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
+const archiver = require('archiver');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
@@ -199,6 +200,147 @@ function creditStatusPill(status) {
   return `<span class="pill ${cls}">${esc(status||'draft')}</span>`;
 }
 
+
+function normaliseMonth(value) {
+  const s=String(value||'').trim();
+  return /^\d{4}-\d{2}$/.test(s)?s:'';
+}
+
+function monthBounds(month) {
+  const m=normaliseMonth(month);
+  if(!m) return null;
+  const [y,mo]=m.split('-').map(Number);
+  const start=`${y}-${String(mo).padStart(2,'0')}-01`;
+  const nextMo=mo===12?1:mo+1;
+  const nextY=mo===12?y+1:y;
+  const end=`${nextY}-${String(nextMo).padStart(2,'0')}-01`;
+  return {start,end};
+}
+
+function monthLabel(month) {
+  const b=monthBounds(month);
+  if(!b) return '';
+  const [y,m]=month.split('-').map(Number);
+  const d=new Date(Date.UTC(y,m-1,1));
+  return d.toLocaleDateString('en-GB',{month:'long',year:'numeric',timeZone:'UTC'});
+}
+
+function csvEscape(v) {
+  const s=String(v??'');
+  return /[",\n\r]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;
+}
+
+async function monthEndIncomeRows(tenantId, month) {
+  const b=monthBounds(month);
+  if(!b) return [];
+  return (await pool.query(`
+    SELECT
+      i.id AS invoice_id,
+      i.invoice_number,
+      i.issue_date,
+      i.due_date,
+      i.subtotal_minor,
+      i.tax_minor,
+      i.total_minor,
+      i.paid_minor,
+      i.credited_minor,
+      i.outstanding_minor,
+      i.status,
+      COALESCE(i.snapshot_contact_name,c.contact_name) AS contact_name,
+      COALESCE(i.snapshot_company_name,c.company_name) AS company_name,
+      COALESCE(i.snapshot_email,c.email) AS email,
+      SUM(p.amount_minor)::bigint AS received_in_month_minor,
+      MIN(p.paid_at) AS first_payment_in_month,
+      MAX(p.paid_at) AS last_payment_in_month,
+      STRING_AGG(DISTINCT p.method, ', ' ORDER BY p.method) AS payment_methods,
+      STRING_AGG(DISTINCT COALESCE(NULLIF(p.reference,''),'—'), ', ') AS payment_references
+    FROM customer_invoice_payments p
+    JOIN customer_invoices i ON i.id=p.invoice_id
+    JOIN invoice_customers c ON c.id=i.customer_id
+    WHERE p.tenant_id=$1
+      AND p.paid_at >= $2::date
+      AND p.paid_at < $3::date
+    GROUP BY
+      i.id,i.invoice_number,i.issue_date,i.due_date,i.subtotal_minor,i.tax_minor,i.total_minor,
+      i.paid_minor,i.credited_minor,i.outstanding_minor,i.status,
+      i.snapshot_contact_name,c.contact_name,i.snapshot_company_name,c.company_name,
+      i.snapshot_email,c.email
+    ORDER BY MIN(p.paid_at),i.invoice_number
+  `,[tenantId,b.start,b.end])).rows;
+}
+
+async function monthEndCreditRows(tenantId, month) {
+  const b=monthBounds(month);
+  if(!b) return [];
+  return (await pool.query(`
+    SELECT
+      cn.id AS credit_note_id,
+      cn.credit_note_number,
+      cn.issue_date,
+      cn.reason,
+      cn.subtotal_minor,
+      cn.tax_minor,
+      cn.total_minor,
+      i.invoice_number AS original_invoice_number,
+      COALESCE(cn.snapshot_contact_name,c.contact_name) AS contact_name,
+      COALESCE(cn.snapshot_company_name,c.company_name) AS company_name
+    FROM customer_credit_notes cn
+    JOIN customer_invoices i ON i.id=cn.original_invoice_id
+    JOIN invoice_customers c ON c.id=cn.customer_id
+    WHERE cn.tenant_id=$1
+      AND cn.status='issued'
+      AND cn.issue_date >= $2::date
+      AND cn.issue_date < $3::date
+    ORDER BY cn.issue_date,cn.credit_note_number
+  `,[tenantId,b.start,b.end])).rows;
+}
+
+function monthEndIncomeCsv(rows, month) {
+  const header=[
+    'Month','Invoice Number','Customer','Email','Invoice Date','Due Date',
+    'Invoice Net','Invoice VAT','Invoice Total','Received In Selected Month',
+    'First Payment Date','Last Payment Date','Payment Method(s)','Payment Reference(s)',
+    'Total Paid To Date','Credits To Date','Outstanding Balance','Status'
+  ];
+  const data=rows.map(r=>[
+    monthLabel(month),
+    r.invoice_number||'',
+    r.company_name||r.contact_name||'',
+    r.email||'',
+    fmtDate(r.issue_date),
+    fmtDate(r.due_date),
+    major(r.subtotal_minor).toFixed(2),
+    major(r.tax_minor).toFixed(2),
+    major(r.total_minor).toFixed(2),
+    major(r.received_in_month_minor).toFixed(2),
+    fmtDate(r.first_payment_in_month),
+    fmtDate(r.last_payment_in_month),
+    r.payment_methods||'',
+    r.payment_references||'',
+    major(r.paid_minor).toFixed(2),
+    major(r.credited_minor||0).toFixed(2),
+    major(r.outstanding_minor).toFixed(2),
+    r.status||''
+  ]);
+  return [header,...data].map(row=>row.map(csvEscape).join(',')).join('\n');
+}
+
+function monthEndCreditsCsv(rows, month) {
+  const header=['Month','Credit Note','Original Invoice','Customer','Issue Date','Reason','Net Credit','VAT Credit','Total Credit'];
+  const data=rows.map(r=>[
+    monthLabel(month),
+    r.credit_note_number||'',
+    r.original_invoice_number||'',
+    r.company_name||r.contact_name||'',
+    fmtDate(r.issue_date),
+    r.reason||'',
+    major(r.subtotal_minor).toFixed(2),
+    major(r.tax_minor).toFixed(2),
+    major(r.total_minor).toFixed(2)
+  ]);
+  return [header,...data].map(row=>row.map(csvEscape).join(',')).join('\n');
+}
+
 const nav = (active) => `
   <aside class="side">
     <div class="brand"><span class="mark">S</span><div><strong>SOTOBOATS</strong><small>INVOICING · YDP PILOT</small></div></div>
@@ -206,6 +348,7 @@ const nav = (active) => `
       <a class="${active==='dashboard'?'active':''}" href="/">Dashboard</a>
       <a class="${active==='invoices'?'active':''}" href="/invoices">Invoices</a>
       <a class="${active==='credit-notes'?'active':''}" href="/credit-notes">Credit Notes</a>
+      <a class="${active==='month-end'?'active':''}" href="/month-end">Month End</a>
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
@@ -1654,6 +1797,168 @@ app.post('/credit-notes/:id/email',async(req,res)=>{
     try{await client.query('ROLLBACK');}catch(_){}
     res.status(400).send(shell('Credit note email error','credit-notes',`<section class="card"><h2>Could not send credit note</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/credit-notes/${req.params.id}">Back</a></section>`));
   }finally{client.release();}
+});
+
+
+app.get('/month-end',async(req,res)=>{
+  const tenant=await getTenant();
+  const today=new Date();
+  const defaultMonth=`${today.getUTCFullYear()}-${String(today.getUTCMonth()+1).padStart(2,'0')}`;
+  const month=normaliseMonth(req.query.month)||defaultMonth;
+  const income=await monthEndIncomeRows(tenant.id,month);
+  const credits=await monthEndCreditRows(tenant.id,month);
+
+  const received=income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0);
+  const invoiceCount=income.length;
+  const creditTotal=credits.reduce((s,r)=>s+Number(r.total_minor||0),0);
+
+  const incomeTable=income.length?`<div class="table-wrap"><table>
+    <thead><tr><th>Invoice</th><th>Customer</th><th>Payment date(s)</th><th>Invoice total</th><th>Received this month</th><th>Method</th><th>Outstanding</th><th></th></tr></thead>
+    <tbody>${income.map(r=>`<tr>
+      <td><strong>${esc(r.invoice_number||'')}</strong><br><span class="muted">${fmtDate(r.issue_date)}</span></td>
+      <td><strong>${esc(r.company_name||r.contact_name||'')}</strong><br><span class="muted">${esc(r.email||'')}</span></td>
+      <td>${fmtDate(r.first_payment_in_month)}${String(r.first_payment_in_month)!==String(r.last_payment_in_month)?` – ${fmtDate(r.last_payment_in_month)}`:''}</td>
+      <td>${euro(r.total_minor)}</td>
+      <td><strong>${euro(r.received_in_month_minor)}</strong></td>
+      <td>${esc(r.payment_methods||'—')}</td>
+      <td>${euro(r.outstanding_minor)}</td>
+      <td><a class="btn light" href="/invoices/${r.invoice_id}">Open</a></td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No payments were recorded in this month.</p>';
+
+  const creditTable=credits.length?`<div class="table-wrap"><table>
+    <thead><tr><th>Credit note</th><th>Original invoice</th><th>Customer</th><th>Date</th><th>Reason</th><th>Total credit</th><th></th></tr></thead>
+    <tbody>${credits.map(r=>`<tr>
+      <td><strong>${esc(r.credit_note_number||'')}</strong></td>
+      <td>${esc(r.original_invoice_number||'')}</td>
+      <td>${esc(r.company_name||r.contact_name||'')}</td>
+      <td>${fmtDate(r.issue_date)}</td>
+      <td>${esc(r.reason||'')}</td>
+      <td>${euro(r.total_minor)}</td>
+      <td><a class="btn light" href="/credit-notes/${r.credit_note_id}">Open</a></td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No credit notes were issued in this month.</p>';
+
+  const content=`<section class="card">
+    <div class="actions" style="justify-content:space-between;align-items:end">
+      <div><h2 style="margin:0">Accountant / Month End</h2><p class="sub" style="margin:5px 0 0">Income is grouped by the date payment was actually received.</p></div>
+      <form method="get" action="/month-end" class="actions" style="align-items:end">
+        <label>Month<input type="month" name="month" value="${esc(month)}"></label>
+        <button class="btn gold">Load month</button>
+      </form>
+    </div>
+  </section>
+
+  <div class="metrics">
+    <div class="metric"><small>Payments received</small><strong>${euro(received)}</strong></div>
+    <div class="metric"><small>Invoices paid into</small><strong>${invoiceCount}</strong></div>
+    <div class="metric"><small>Credit notes issued</small><strong>${credits.length}</strong></div>
+    <div class="metric"><small>Credit total</small><strong>${euro(creditTotal)}</strong></div>
+  </div>
+
+  <section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div><h2 style="margin:0">Payments received — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Partial payments count only the amount received during this month.</p></div>
+      <div class="actions">
+        <a class="btn light" href="/month-end/income.csv?month=${encodeURIComponent(month)}">Download CSV</a>
+        <a class="btn gold" href="/month-end/accountant-pack.zip?month=${encodeURIComponent(month)}">Download accountant pack</a>
+      </div>
+    </div>
+    ${incomeTable}
+  </section>
+
+  <section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div><h2 style="margin:0">Credit notes issued — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Included separately so the accountant can see corrections against original invoices.</p></div>
+      ${credits.length?`<a class="btn light" href="/month-end/credit-notes.csv?month=${encodeURIComponent(month)}">Download credit-note CSV</a>`:''}
+    </div>
+    ${creditTable}
+  </section>
+
+  <section class="card">
+    <h2>Expenses</h2>
+    <p class="sub">The expense-scanning inbox will sit here next: upload receipts/invoices → extract supplier/date/net/VAT/gross → review → include in the same accountant pack.</p>
+  </section>`;
+
+  res.send(shell(`Month End – ${monthLabel(month)}`,'month-end',content,'Monthly accountant pack based on real receipts of payment.'));
+});
+
+app.get('/month-end/income.csv',async(req,res)=>{
+  const tenant=await getTenant();
+  const month=normaliseMonth(req.query.month);
+  if(!month)return res.status(400).send('Choose a valid month.');
+  const rows=await monthEndIncomeRows(tenant.id,month);
+  const csv=monthEndIncomeCsv(rows,month);
+  res.type('text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Income-${month}.csv"`);
+  res.send('\uFEFF'+csv);
+});
+
+app.get('/month-end/credit-notes.csv',async(req,res)=>{
+  const tenant=await getTenant();
+  const month=normaliseMonth(req.query.month);
+  if(!month)return res.status(400).send('Choose a valid month.');
+  const rows=await monthEndCreditRows(tenant.id,month);
+  const csv=monthEndCreditsCsv(rows,month);
+  res.type('text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Credit-Notes-${month}.csv"`);
+  res.send('\uFEFF'+csv);
+});
+
+app.get('/month-end/accountant-pack.zip',async(req,res)=>{
+  try{
+    const tenant=await getTenant();
+    const month=normaliseMonth(req.query.month);
+    if(!month)return res.status(400).send('Choose a valid month.');
+
+    const income=await monthEndIncomeRows(tenant.id,month);
+    const credits=await monthEndCreditRows(tenant.id,month);
+
+    res.setHeader('Content-Type','application/zip');
+    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Accountant-Pack-${month}.zip"`);
+
+    const archive=archiver('zip',{zlib:{level:9}});
+    archive.on('error',err=>{throw err;});
+    archive.pipe(res);
+
+    archive.append('\uFEFF'+monthEndIncomeCsv(income,month),{name:`Sotoboats-Income-${month}.csv`});
+    if(credits.length)archive.append('\uFEFF'+monthEndCreditsCsv(credits,month),{name:`Sotoboats-Credit-Notes-${month}.csv`});
+
+    const summaryLines=[
+      `Sotoboats Accountant Pack – ${monthLabel(month)}`,
+      '',
+      `Payments received: ${euro(income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0))}`,
+      `Invoices with payments: ${income.length}`,
+      `Credit notes issued: ${credits.length}`,
+      `Credit-note total: ${euro(credits.reduce((s,r)=>s+Number(r.total_minor||0),0))}`,
+      '',
+      'Income selection basis: payment received date.',
+      'Partial payments are included only for the amount received during the selected month.',
+      'Invoice PDFs are included once per invoice that received at least one payment in the selected month.',
+      'Credit-note PDFs are included for credit notes issued in the selected month.'
+    ];
+    archive.append(summaryLines.join('\n'),{name:`README-${month}.txt`});
+
+    for(const row of income){
+      const data=await loadInvoice(row.invoice_id);
+      if(!data||!data.invoice.locked_at)continue;
+      const pdf=await buildInvoicePdfBuffer(data);
+      const safeNo=String(data.invoice.invoice_number||row.invoice_id).replace(/[^a-zA-Z0-9._-]/g,'_');
+      archive.append(pdf,{name:`Invoices/Sotoboats-Invoice-${safeNo}.pdf`});
+    }
+
+    for(const row of credits){
+      const data=await loadCreditNote(row.credit_note_id);
+      if(!data||!data.note.locked_at)continue;
+      const pdf=await buildCreditNotePdfBuffer(data);
+      const safeNo=String(data.note.credit_note_number||row.credit_note_id).replace(/[^a-zA-Z0-9._-]/g,'_');
+      archive.append(pdf,{name:`Credit Notes/Sotoboats-Credit-Note-${safeNo}.pdf`});
+    }
+
+    await archive.finalize();
+  }catch(err){
+    console.error(err);
+    if(!res.headersSent)res.status(500).send(esc(err.message));
+    else res.end();
+  }
 });
 
 app.get('/settings',async(req,res)=>{
