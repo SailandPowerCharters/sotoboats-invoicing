@@ -106,7 +106,12 @@ const nav = (active) => `
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
     <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><a href="/logout">Sign out →</a></div>
-  </aside>`;
+  </aside>
+  .preset-wrap{display:grid;grid-template-columns:1fr 110px 1fr 1fr;gap:8px;margin-bottom:8px}
+  .preset-wrap .hours-wrap,.preset-wrap .from-wrap,.preset-wrap .to-wrap{display:none}
+  .preset-wrap.show-hours .hours-wrap{display:grid}
+  .preset-wrap.show-route .from-wrap,.preset-wrap.show-route .to-wrap{display:grid}
+`;
 
 function shell(title, active, content, subtitle='') {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -169,7 +174,33 @@ app.get('/invoices',async(req,res)=>{
 
 function lineRowsHtml(items=[]) {
   const rows=items.length?items:[{description_en:'',description_es:'',detail_en:'',detail_es:'',quantity:1,unit_price_minor:0,tax_rate:21}];
-  return rows.map((i,idx)=>`<div class="line-grid line-row"><div><label>English description<input name="description_en" value="${esc(i.description_en||'')}" required></label><label style="margin-top:6px">English detail<input name="detail_en" value="${esc(i.detail_en||'')}"></label></div><div><label>Spanish description<input name="description_es" value="${esc(i.description_es||'')}"></label><label style="margin-top:6px">Spanish detail<input name="detail_es" value="${esc(i.detail_es||'')}"></label></div><label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="${Number(i.quantity||1)}" required></label><label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="${major(i.unit_price_minor||0).toFixed(2)}" required></label><label>VAT<select name="tax_rate"><option value="0" ${Number(i.tax_rate)===0?'selected':''}>0%</option><option value="10" ${Number(i.tax_rate)===10?'selected':''}>10%</option><option value="21" ${Number(i.tax_rate)===21?'selected':''}>21%</option></select></label><button class="remove" type="button" onclick="this.closest('.line-row').remove();calcInvoice()">×</button></div>`).join('');
+  const presetOptions=`
+    <option value="">Choose a description…</option>
+    <option value="tuition">Private sailing tuition</option>
+    <option value="sunseeker">Charter – Sunseeker</option>
+    <option value="catamaran">Charter – Catamaran</option>
+    <option value="jeanneau">Charter – Jeanneau sail boat</option>
+    <option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>
+    <option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>
+    <option value="subsistence">Subsistence / cleaning / onboard facilities</option>
+    <option value="delivery">Boat delivery</option>
+    <option value="custom">Other / Custom description</option>`;
+  return rows.map((i,idx)=>`<div class="line-grid line-row">
+    <div style="grid-column:1/-1">
+      <div class="preset-wrap">
+        <label>Description template<select class="description-preset">${presetOptions}</select></label>
+        <label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="e.g. 4"></label>
+        <label class="from-wrap">From<input class="preset-from" placeholder="e.g. Estepona"></label>
+        <label class="to-wrap">To<input class="preset-to" placeholder="e.g. Ibiza"></label>
+      </div>
+    </div>
+    <div><label>English description<input class="desc-en" name="description_en" value="${esc(i.description_en||'')}" required></label><label style="margin-top:6px">English detail<input name="detail_en" value="${esc(i.detail_en||'')}"></label></div>
+    <div><label>Spanish description<input class="desc-es" name="description_es" value="${esc(i.description_es||'')}"></label><label style="margin-top:6px">Spanish detail<input name="detail_es" value="${esc(i.detail_es||'')}"></label></div>
+    <label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="${Number(i.quantity||1)}" required></label>
+    <label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="${major(i.unit_price_minor||0).toFixed(2)}" required></label>
+    <label>VAT<select name="tax_rate"><option value="0" ${Number(i.tax_rate)===0?'selected':''}>0%</option><option value="10" ${Number(i.tax_rate)===10?'selected':''}>10%</option><option value="21" ${Number(i.tax_rate)===21?'selected':''}>21%</option></select></label>
+    <button class="remove" type="button">×</button>
+  </div>`).join('');
 }
 
 async function invoiceForm(res, invoice=null, items=[]) {
@@ -183,18 +214,147 @@ async function invoiceForm(res, invoice=null, items=[]) {
   const action=edit?`/invoices/${invoice.id}/edit`:'/invoices/new';
   const content=`<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${edit?'Edit draft':'New invoice'}</h2><p class="sub">Invoice numbers are allocated only when you issue the invoice.</p></div>${edit?`<a class="btn light" href="/invoices/${invoice.id}">Back to invoice</a>`:''}</div><form method="post" action="${action}" id="invoiceForm"><div class="form-grid three"><label>Customer<select name="customer_id" required><option value="">Choose customer</option>${customers.map(c=>`<option value="${c.id}" ${invoice?.customer_id===c.id?'selected':''}>${esc(c.company_name||c.contact_name)}</option>`).join('')}</select></label><label>Invoice language<select name="invoice_language"><option value="bilingual" ${invoice?.invoice_language==='bilingual'||!invoice?'selected':''}>Bilingual</option><option value="en" ${invoice?.invoice_language==='en'?'selected':''}>English</option><option value="es" ${invoice?.invoice_language==='es'?'selected':''}>Spanish</option></select></label><label>Booking reference<input name="booking_reference" value="${esc(invoice?.booking_reference||'')}"></label><label>Service / course title<input name="service_title" value="${esc(invoice?.service_title||'')}" placeholder="e.g. Private Sailing Tuition" required></label><label>Start date<input id="serviceStart" type="date" name="service_start_date" value="${iso(invoice?.service_start_date)}"></label><label>End date<input type="date" name="service_end_date" value="${iso(invoice?.service_end_date)}"></label><label>Issue date<input type="date" name="issue_date" value="${issueDate}"></label><label>Due date<input type="date" name="due_date" value="${dueDate}"></label><label>Payment due now<select id="paymentMode" name="payment_mode"><option value="auto" ${invoice?.payment_mode==='auto'||!invoice?'selected':''}>Auto from booking date</option><option value="full" ${invoice?.payment_mode==='full'?'selected':''}>Full balance</option><option value="deposit" ${invoice?.payment_mode==='deposit'?'selected':''}>25% deposit</option><option value="custom" ${invoice?.payment_mode==='custom'?'selected':''}>Custom amount</option></select></label><label id="customDueWrap" class="${invoice?.payment_mode==='custom'?'':'hide'}">Custom amount due €<input id="customDue" type="number" step="0.01" min="0" name="custom_amount_due" value="${invoice?.payment_mode==='custom'&&invoice.amount_due_now_minor!=null?major(invoice.amount_due_now_minor).toFixed(2):''}"></label><label>Customer reference<input name="customer_reference" value="${esc(invoice?.customer_reference||'')}"></label><label>Bank transfer<select name="bank_transfer_enabled"><option value="1" ${invoice?.bank_transfer_enabled!==false?'selected':''}>Enabled</option><option value="0" ${invoice?.bank_transfer_enabled===false?'selected':''}>Disabled</option></select></label></div><div class="card" style="margin-top:16px;background:#fbfcfc"><h2>Invoice lines</h2><div id="lineRows">${lineRowsHtml(items)}</div><div class="actions" style="margin-top:10px"><button class="btn light" type="button" id="addLine">+ Add line</button></div><div class="totals"><div class="totals-row"><span>Net</span><strong id="calcNet">€0.00</strong></div><div class="totals-row"><span>VAT</span><strong id="calcVat">€0.00</strong></div><div class="totals-row total"><span>Total</span><strong id="calcTotal">€0.00</strong></div><div class="totals-row"><span>Due now</span><strong id="calcDue">€0.00</strong></div></div></div><div class="form-grid"><label class="full">Customer notes<textarea name="customer_notes">${esc(invoice?.customer_notes||'')}</textarea></label><label class="full">Internal notes<textarea name="internal_notes">${esc(invoice?.internal_notes||'')}</textarea></label></div><div class="notice" id="depositNotice" style="margin-top:12px">The automatic rule uses Sotoboats' current terms: 25% deposit when the start date is more than 30 days away; otherwise full payment is due.</div><div class="actions" style="margin-top:14px"><button class="btn gold">${edit?'Save draft changes':'Save draft'}</button></div></form></section><script>
   const depPct=${Number(tenant.deposit_percent)}; const threshold=${Number(tenant.deposit_threshold_days)};
+  const descriptionPresets={
+    tuition:{
+      type:'hours',
+      en:h=>`Private sailing tuition (departing from Estepona, life jackets provided. Up to ${h||'X'} hour${Number(h)===1?'':'s'} of sailing)`,
+      es:h=>`Clases particulares de vela (salida desde Estepona, chalecos salvavidas incluidos. Hasta ${h||'X'} hora${Number(h)===1?'':'s'} de navegación)`
+    },
+    sunseeker:{
+      type:'hours',
+      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Sunseeker (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
+      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Sunseeker (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+    },
+    catamaran:{
+      type:'hours',
+      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Catamaran (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
+      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Catamarán (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+    },
+    jeanneau:{
+      type:'hours',
+      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Jeanneau sail boat (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
+      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Velero Jeanneau (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+    },
+    morocco_tuition:{
+      type:'fixed',
+      en:()=>`Morocco sailing trip – Sailing tuition`,
+      es:()=>`Viaje a vela a Marruecos – Clases de vela`
+    },
+    morocco_subsistence:{
+      type:'fixed',
+      en:()=>`Morocco sailing trip – Subsistence, cleaning, use of onboard facilities`,
+      es:()=>`Viaje a vela a Marruecos – Manutención, limpieza y uso de las instalaciones a bordo`
+    },
+    subsistence:{
+      type:'fixed',
+      en:()=>`Subsistence, cleaning, use of onboard facilities`,
+      es:()=>`Manutención, limpieza y uso de las instalaciones a bordo`
+    },
+    delivery:{
+      type:'route',
+      en:(a,b)=>`Boat delivery from ${a||'X'} to ${b||'X'} (excluding fuel, insurance)`,
+      es:(a,b)=>`Traslado de embarcación de ${a||'X'} a ${b||'X'} (combustible y seguro no incluidos)`
+    }
+  };
+
+  function updatePreset(row){
+    const key=row.querySelector('.description-preset')?.value||'';
+    const wrap=row.querySelector('.preset-wrap');
+    wrap.classList.remove('show-hours','show-route');
+    if(!key || key==='custom') return;
+    const p=descriptionPresets[key];
+    if(!p) return;
+    if(p.type==='hours') wrap.classList.add('show-hours');
+    if(p.type==='route') wrap.classList.add('show-route');
+    const h=row.querySelector('.preset-hours')?.value||'';
+    const a=row.querySelector('.preset-from')?.value||'';
+    const b=row.querySelector('.preset-to')?.value||'';
+    row.querySelector('.desc-en').value=p.type==='route'?p.en(a,b):p.en(h);
+    row.querySelector('.desc-es').value=p.type==='route'?p.es(a,b):p.es(h);
+  }
+
+  function wireLineRow(row){
+    row.querySelector('.remove')?.addEventListener('click',()=>{
+      if(document.querySelectorAll('.line-row').length>1) row.remove();
+      else {
+        row.querySelectorAll('input[type=text], input:not([type])').forEach(x=>x.value='');
+        row.querySelector('.desc-en').value='';
+        row.querySelector('.desc-es').value='';
+      }
+      calcInvoice();
+    });
+    row.querySelector('.description-preset')?.addEventListener('change',()=>updatePreset(row));
+    row.querySelector('.preset-hours')?.addEventListener('input',()=>updatePreset(row));
+    row.querySelector('.preset-from')?.addEventListener('input',()=>updatePreset(row));
+    row.querySelector('.preset-to')?.addEventListener('input',()=>updatePreset(row));
+    row.querySelectorAll('input,select').forEach(x=>x.addEventListener('input',calcInvoice));
+  }
+
   function addLine(){
     const wrap=document.getElementById('lineRows');
     const d=document.createElement('div');
     d.className='line-grid line-row';
-    d.innerHTML="<div><label>English description<input name='description_en' required></label><label style='margin-top:6px'>English detail<input name='detail_en'></label></div><div><label>Spanish description<input name='description_es'></label><label style='margin-top:6px'>Spanish detail<input name='detail_es'></label></div><label>Qty<input type='number' min='0.001' step='0.001' name='quantity' value='1' required></label><label>Net unit €<input type='number' min='0' step='0.01' name='unit_price' value='0.00' required></label><label>VAT<select name='tax_rate'><option value='0'>0%</option><option value='10'>10%</option><option value='21' selected>21%</option></select></label><button class='remove' type='button'>×</button>";
+    d.innerHTML=`<div style="grid-column:1/-1">
+      <div class="preset-wrap">
+        <label>Description template<select class="description-preset">
+          <option value="">Choose a description…</option>
+          <option value="tuition">Private sailing tuition</option>
+          <option value="sunseeker">Charter – Sunseeker</option>
+          <option value="catamaran">Charter – Catamaran</option>
+          <option value="jeanneau">Charter – Jeanneau sail boat</option>
+          <option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>
+          <option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>
+          <option value="subsistence">Subsistence / cleaning / onboard facilities</option>
+          <option value="delivery">Boat delivery</option>
+          <option value="custom">Other / Custom description</option>
+        </select></label>
+        <label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="e.g. 4"></label>
+        <label class="from-wrap">From<input class="preset-from" placeholder="e.g. Estepona"></label>
+        <label class="to-wrap">To<input class="preset-to" placeholder="e.g. Ibiza"></label>
+      </div>
+    </div>
+    <div><label>English description<input class="desc-en" name="description_en" required></label><label style="margin-top:6px">English detail<input name="detail_en"></label></div>
+    <div><label>Spanish description<input class="desc-es" name="description_es"></label><label style="margin-top:6px">Spanish detail<input name="detail_es"></label></div>
+    <label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="1" required></label>
+    <label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="0.00" required></label>
+    <label>VAT<select name="tax_rate"><option value="0">0%</option><option value="10">10%</option><option value="21" selected>21%</option></select></label>
+    <button class="remove" type="button">×</button>`;
     wrap.appendChild(d);
-    d.querySelector('.remove').addEventListener('click',()=>{d.remove();calcInvoice();});
-    d.querySelectorAll('input,select').forEach(x=>x.addEventListener('input',calcInvoice));
+    wireLineRow(d);
     calcInvoice();
   }
-  function calcInvoice(){let net=0,vat=0;document.querySelectorAll('.line-row').forEach(r=>{const q=parseFloat(r.querySelector('[name=quantity]').value)||0;const p=parseFloat(r.querySelector('[name=unit_price]').value)||0;const t=parseFloat(r.querySelector('[name=tax_rate]').value)||0;const n=q*p;net+=n;vat+=n*t/100;});const total=net+vat;let due=total;const mode=document.getElementById('paymentMode').value;document.getElementById('customDueWrap').classList.toggle('hide',mode!=='custom');if(mode==='deposit')due=total*depPct/100;if(mode==='custom')due=parseFloat(document.getElementById('customDue').value)||0;if(mode==='auto'){const s=document.getElementById('serviceStart').value;if(s){const days=(new Date(s+'T12:00:00')-new Date())/86400000;due=days>threshold?total*depPct/100:total;}}document.getElementById('calcNet').textContent='€'+net.toFixed(2);document.getElementById('calcVat').textContent='€'+vat.toFixed(2);document.getElementById('calcTotal').textContent='€'+total.toFixed(2);document.getElementById('calcDue').textContent='€'+Math.max(0,due).toFixed(2);}
-  document.getElementById('addLine').addEventListener('click',addLine);document.getElementById('invoiceForm').addEventListener('input',calcInvoice);calcInvoice();
+
+  function calcInvoice(){
+    let net=0,vat=0;
+    document.querySelectorAll('.line-row').forEach(r=>{
+      const q=parseFloat(r.querySelector('[name=quantity]').value)||0;
+      const p=parseFloat(r.querySelector('[name=unit_price]').value)||0;
+      const t=parseFloat(r.querySelector('[name=tax_rate]').value)||0;
+      const n=q*p;net+=n;vat+=n*t/100;
+    });
+    const total=net+vat;
+    let due=total;
+    const mode=document.getElementById('paymentMode').value;
+    document.getElementById('customDueWrap').classList.toggle('hide',mode!=='custom');
+    if(mode==='deposit')due=total*depPct/100;
+    if(mode==='custom')due=parseFloat(document.getElementById('customDue').value)||0;
+    if(mode==='auto'){
+      const s=document.getElementById('serviceStart').value;
+      if(s){
+        const days=(new Date(s+'T12:00:00')-new Date())/86400000;
+        due=days>threshold?total*depPct/100:total;
+      }
+    }
+    document.getElementById('calcNet').textContent='€'+net.toFixed(2);
+    document.getElementById('calcVat').textContent='€'+vat.toFixed(2);
+    document.getElementById('calcTotal').textContent='€'+total.toFixed(2);
+    document.getElementById('calcDue').textContent='€'+Math.max(0,due).toFixed(2);
+  }
+
+  document.querySelectorAll('.line-row').forEach(wireLineRow);
+  document.getElementById('addLine').addEventListener('click',addLine);
+  document.getElementById('invoiceForm').addEventListener('input',calcInvoice);
+  calcInvoice();
   </script>`;
   res.send(shell(edit?'Edit Invoice':'Create Invoice','invoices',content,'Spanish VAT by line, bilingual wording and Sotoboats deposit logic.'));
 }
