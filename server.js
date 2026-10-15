@@ -34,24 +34,33 @@ const esc = (v = '') => String(v ?? '')
 const minor = (v) => Math.round(Number(v || 0) * 100);
 const major = (v) => Number(v || 0) / 100;
 const euro = (v) => `€${major(v).toLocaleString('en-IE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const fmtDate = (v) => {
-  if (!v) return '—';
+const dateYmd = (v) => {
+  if (!v) return '';
 
-  // PostgreSQL DATE values may arrive as either YYYY-MM-DD strings or JS Date objects.
-  // Always show invoice dates as date-only DD/MM/YYYY — never time/timezone text.
-  const raw = String(v);
-  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (isoMatch) return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`;
+  // Native PostgreSQL DATE strings.
+  if (typeof v === 'string') {
+    const m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  }
 
+  // pg may return DATE values as JavaScript Date objects.
   const d = v instanceof Date ? v : new Date(v);
-  if (Number.isNaN(d.getTime())) return esc(raw);
+  if (Number.isNaN(d.getTime())) return '';
 
-  const dd = String(d.getUTCDate()).padStart(2,'0');
-  const mm = String(d.getUTCMonth()+1).padStart(2,'0');
   const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+const fmtDate = (v) => {
+  const ymd = dateYmd(v);
+  if (!ymd) return '—';
+  const [yyyy, mm, dd] = ymd.split('-');
   return `${dd}/${mm}/${yyyy}`;
 };
-const iso = (v) => v ? String(v).slice(0,10) : '';
+
+const iso = (v) => dateYmd(v);
 
 async function getTenant(client = pool) {
   const { rows } = await client.query(`SELECT * FROM invoice_tenants WHERE code='SOTOBOATS' LIMIT 1`);
