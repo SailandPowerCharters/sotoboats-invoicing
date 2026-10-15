@@ -3,6 +3,7 @@ const express = require('express');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const PDFDocument = require('pdfkit');
+const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
 
@@ -41,7 +42,7 @@ const iso = (v) => v ? String(v).slice(0,10) : '';
 
 async function getTenant(client = pool) {
   const { rows } = await client.query(`SELECT * FROM invoice_tenants WHERE code='SOTOBOATS' LIMIT 1`);
-  if (!rows[0]) throw new Error('Sotoboats tenant is missing. Run npm run db:init first.');
+  if (!rows[0]) throw new Error('Sotoboats tenant is missing. Database startup initialisation did not complete.');
   return rows[0];
 }
 
@@ -296,4 +297,21 @@ app.get('/health',async(_req,res)=>{try{await pool.query('SELECT 1');res.json({o
 
 app.use((err,req,res,next)=>{console.error(err);res.status(500).send(shell('Error','',`<section class="card"><h2>Something went wrong</h2><p class="sub">${esc(err.message||'Unknown error')}</p></section>`));});
 
-app.listen(PORT,()=>console.log(`Sotoboats Invoicing v1 running on port ${PORT}`));
+async function initialiseDatabase() {
+  const schemaPath = path.join(__dirname, 'schema.sql');
+  const sql = fs.readFileSync(schemaPath, 'utf8');
+  await pool.query(sql);
+  console.log('Sotoboats invoicing database schema checked / initialised.');
+}
+
+async function startApp() {
+  try {
+    await initialiseDatabase();
+    app.listen(PORT, () => console.log(`Sotoboats Invoicing v1 running on port ${PORT}`));
+  } catch (err) {
+    console.error('Database startup initialisation failed:', err);
+    process.exit(1);
+  }
+}
+
+startApp();
