@@ -258,7 +258,7 @@ function invoicePreview(data){
 
 function getMailTransporter() {
   const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || 587);
+  const port = Number(process.env.SMTP_PORT || 465);
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   if (!host || !user || !pass) {
@@ -268,7 +268,13 @@ function getMailTransporter() {
     host,
     port,
     secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
-    auth: { user, pass }
+    auth: { user, pass },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+    tls: {
+      servername: host
+    }
   });
 }
 
@@ -450,7 +456,6 @@ app.post('/invoices/:id/email',async(req,res)=>{
     if(!i.email) throw new Error('This customer does not have an email address.');
 
     const transporter=getMailTransporter();
-    await transporter.verify();
 
     const pdf=await buildInvoicePdfBuffer(data);
     const from=process.env.SMTP_FROM || tenant.email || process.env.SMTP_USER;
