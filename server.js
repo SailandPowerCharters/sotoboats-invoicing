@@ -3,6 +3,7 @@ const express = require('express');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const PDFDocument = require('pdfkit');
+const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
@@ -254,9 +255,160 @@ function invoicePreview(data){
   return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><h2>SOTOBOATS</h2><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}${identity}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p></div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div><div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
 }
 
+
+function getMailTransporter() {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!host || !user || !pass) {
+    throw new Error('Email is not configured yet. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and SMTP_FROM in Render Environment.');
+  }
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
+    auth: { user, pass }
+  });
+}
+
+function invoiceEmailHtml(data) {
+  const { tenant, invoice:i } = data;
+  const balance = euro(i.outstanding_minor);
+  const due = fmtDate(i.due_date);
+  const name = esc(i.contact_name || i.company_name || 'Customer');
+  const invoiceNo = esc(i.invoice_number || '');
+  return `<!doctype html>
+  <html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
+    <div style="max-width:650px;margin:0 auto;padding:28px 16px">
+      <div style="background:#0b1d2f;padding:24px;border-radius:14px 14px 0 0">
+        <div style="color:#caa86d;font-size:12px;letter-spacing:.16em;font-weight:700">SOTOBOATS</div>
+        <div style="color:#fff;font-size:24px;font-weight:700;margin-top:5px">Invoice ${invoiceNo}</div>
+      </div>
+      <div style="background:#fff;padding:28px;border:1px solid #e1e7ea;border-top:0;border-radius:0 0 14px 14px">
+        <p style="margin-top:0">Hello ${name},</p>
+        <p>Please find attached your invoice from <strong>Sotoboats / ${esc(tenant.legal_name)}</strong>.</p>
+        <div style="background:#f5f8fa;border-radius:10px;padding:18px;margin:20px 0">
+          <div style="font-size:12px;color:#72838d">Balance due</div>
+          <div style="font-size:28px;font-weight:700;color:#0b1d2f;margin-top:3px">${balance}</div>
+          <div style="font-size:12px;color:#72838d;margin-top:5px">Due ${due}</div>
+        </div>
+        <p>Payment details are included on the attached invoice.</p>
+        <p style="margin-bottom:0">Thank you,<br><strong>Sotoboats</strong></p>
+      </div>
+      <div style="text-align:center;color:#8998a0;font-size:11px;padding:16px">
+        ${esc(tenant.legal_name)} · ${esc(tenant.email || '')}
+      </div>
+    </div>
+  </body></html>`;
+}
+
+function buildInvoicePdfBuffer(data) {
+  return new Promise((resolve, reject) => {
+    try {
+      const {tenant,invoice:i,items}=data;
+      const chunks=[];
+      const doc=new PDFDocument({size:'A4',margin:45});
+      doc.on('data',c=>chunks.push(c));
+      doc.on('end',()=>resolve(Buffer.concat(chunks)));
+      doc.on('error',reject);
+
+      const navy='#0b1d2f', gold='#caa86d', muted='#667783';
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(25).text('SOTOBOATS',45,45);
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(
+        `${tenant.legal_name}\n${tenant.address_1 || ''}\n${tenant.postcode || ''} ${tenant.city || ''}, ${tenant.region || ''}\n${tenant.country_name || ''}\n${tenant.email || ''} · ${tenant.phone || ''}\nCompany ID: ${tenant.tax_id || ''}`,
+        45,82,{width:250}
+      );
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(15).text(`Invoice / Factura ${i.invoice_number}`,330,48,{width:220,align:'right'});
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(
+        `Issue date: ${fmtDate(i.issue_date)}\nDue date: ${fmtDate(i.due_date)}${i.booking_reference?`\nBooking ref: ${i.booking_reference}`:''}`,
+        330,72,{width:220,align:'right'}
+      );
+
+      doc.moveTo(45,150).lineTo(550,150).strokeColor('#dce3e6').stroke();
+      doc.fillColor(gold).font('Helvetica-Bold').fontSize(8).text('BILL TO / FACTURAR A',45,166);
+      doc.fillColor(navy).fontSize(10).text(i.company_name||i.contact_name,45,180);
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(
+        `${i.company_name?i.contact_name+'\n':''}${[i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', ')}\n${i.email||''}\n${i.phone||''}`,
+        45,195,{width:250}
+      );
+
+      let y=250;
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(15).text(
+        `${i.service_title||'Invoice'}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}`,
+        45,y,{width:505}
+      );
+      y+=30;
+      doc.rect(45,y,505,24).fill('#e7eef5');
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('Product or Service',53,y+8);
+      doc.text('Qty',335,y+8); doc.text('Net',380,y+8); doc.text('VAT',435,y+8); doc.text('Total',485,y+8);
+      y+=30;
+
+      const showEs=i.invoice_language!=='en';
+      for(const item of items){
+        const label=[item.description_en,showEs&&item.description_es?item.description_es:null].filter(Boolean).join(' / ');
+        doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text(label,53,y,{width:265});
+        doc.fillColor(muted).font('Helvetica').fontSize(7).text([item.detail_en,showEs?item.detail_es:null].filter(Boolean).join(' / '),53,y+12,{width:265});
+        doc.fillColor(navy).fontSize(8).text(String(Number(item.quantity)),337,y);
+        doc.text(euro(item.unit_price_minor),376,y);
+        doc.text(`${Number(item.tax_rate).toFixed(0)}%`,438,y);
+        doc.text(euro(item.line_total_minor),482,y);
+        y+=42;
+        if(y>650){doc.addPage();y=55;}
+      }
+
+      y+=8;
+      doc.moveTo(330,y).lineTo(550,y).strokeColor('#dce3e6').stroke();
+      y+=10;
+      const vatGroups={};
+      items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});
+      const summary=[
+        ['Subtotal',i.subtotal_minor],
+        ...Object.entries(vatGroups).map(([r,a])=>[`IVA / VAT ${r}%`,a]),
+        ['Tax total',i.tax_minor],
+        ['Invoice total',i.total_minor],
+        ['Amount paid',i.paid_minor],
+        ['Balance due',i.outstanding_minor]
+      ];
+      for(const [label,amt] of summary){
+        const final=label==='Balance due';
+        if(final) doc.rect(325,y-4,225,24).fill('#eef4f7');
+        doc.fillColor(navy).font(final?'Helvetica-Bold':'Helvetica').fontSize(final?11:8).text(label,335,y);
+        doc.text(euro(amt),465,y,{width:75,align:'right'});
+        y+=final?30:20;
+      }
+
+      if(i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)){
+        doc.fillColor(gold).font('Helvetica-Bold').fontSize(9).text(`Amount due now: ${euro(i.amount_due_now_minor)}`,335,y);
+        y+=24;
+      }
+
+      if(y>675){doc.addPage();y=55;}
+      doc.moveTo(45,y).lineTo(550,y).strokeColor('#dce3e6').stroke(); y+=15;
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('English',45,y); y+=12;
+      doc.fillColor(muted).font('Helvetica').fontSize(7).text(tenant.english_footer||'',45,y,{width:505}); y+=55;
+      if(i.bank_transfer_enabled){
+        doc.fillColor(navy).font('Helvetica-Bold').text(
+          `Bank transfer: ${tenant.bank_account_name||''} · IBAN ${tenant.bank_iban||''} · BIC ${tenant.bank_bic||''}`,
+          45,y,{width:505}
+        );
+        y+=25;
+      }
+      if(i.invoice_language!=='en'){
+        doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('Español',45,y); y+=12;
+        doc.fillColor(muted).font('Helvetica').fontSize(7).text(tenant.spanish_footer||'',45,y,{width:505});
+      }
+      doc.end();
+    } catch(err) {
+      reject(err);
+    }
+  });
+}
+
 app.get('/invoices/:id',async(req,res)=>{
   const data=await loadInvoice(req.params.id); if(!data)return res.status(404).send('Invoice not found.'); const i=data.invoice;
-  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>`}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
+  const emailBtn=i.locked_at&&i.email?`<form method="post" action="/invoices/${i.id}/email" onsubmit="return confirm('${i.emailed_at?'Resend':'Send'} invoice ${esc(i.invoice_number||'')} to ${esc(i.email)}?');"><button class="btn gold">${i.emailed_at?'Resend invoice':'Send invoice'}</button></form>`:'';
+  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
   const payment=i.locked_at&&Number(i.outstanding_minor)>0?`<section class="card no-print"><h2>Record payment</h2><form method="post" action="/invoices/${i.id}/payments"><div class="form-grid three"><label>Amount €<input type="number" step="0.01" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" name="amount" value="${major(i.amount_due_now_minor??i.outstanding_minor).toFixed(2)}" required></label><label>Method<select name="method"><option value="bank_transfer">Bank transfer</option><option value="cash">Cash</option><option value="card_external">Card - external</option><option value="other">Other</option></select></label><label>Reference<input name="reference"></label></div><div class="actions" style="margin-top:12px"><button class="btn gold">Record payment</button></div></form></section>`:'';
   const audit=data.events.length?`<section class="card no-print"><h2>Audit trail</h2><div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>Actor</th></tr></thead><tbody>${data.events.map(e=>`<tr><td>${fmtDate(e.created_at)}</td><td>${esc(e.event_type.replaceAll('_',' '))}</td><td>${esc(e.actor_name||'System')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
   res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${payment}${audit}`,i.locked_at?'Issued invoices are locked. Payments can still be recorded.':'This is a draft and can still be edited.'));
@@ -273,22 +425,70 @@ app.post('/invoices/:id/payments',async(req,res)=>{
 });
 
 app.get('/invoices/:id/pdf',async(req,res)=>{
-  const data=await loadInvoice(req.params.id); if(!data)return res.status(404).send('Invoice not found.');
-  const {tenant,invoice:i,items}=data; if(!i.locked_at)return res.status(400).send('Issue the invoice before downloading the PDF.');
-  res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Invoice-${i.invoice_number}.pdf"`);
-  const doc=new PDFDocument({size:'A4',margin:45});doc.pipe(res);
-  const navy='#0b1d2f', gold='#caa86d', muted='#667783';
-  doc.fillColor(navy).font('Helvetica-Bold').fontSize(25).text('SOTOBOATS',45,45);doc.fillColor(muted).font('Helvetica').fontSize(8).text(`${tenant.legal_name}\n${tenant.address_1 || ''}\n${tenant.postcode || ''} ${tenant.city || ''}, ${tenant.region || ''}\n${tenant.country_name || ''}\n${tenant.email || ''} · ${tenant.phone || ''}\nCompany ID: ${tenant.tax_id || ''}`,45,82,{width:250});
-  doc.fillColor(navy).font('Helvetica-Bold').fontSize(15).text(`Invoice / Factura ${i.invoice_number}`,330,48,{width:220,align:'right'});doc.fillColor(muted).font('Helvetica').fontSize(8).text(`Issue date: ${fmtDate(i.issue_date)}\nDue date: ${fmtDate(i.due_date)}${i.booking_reference?`\nBooking ref: ${i.booking_reference}`:''}`,330,72,{width:220,align:'right'});
-  doc.moveTo(45,150).lineTo(550,150).strokeColor('#dce3e6').stroke();doc.fillColor(gold).font('Helvetica-Bold').fontSize(8).text('BILL TO / FACTURAR A',45,166);doc.fillColor(navy).fontSize(10).text(i.company_name||i.contact_name,45,180);doc.fillColor(muted).font('Helvetica').fontSize(8).text(`${i.company_name?i.contact_name+'\n':''}${[i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', ')}\n${i.email||''}\n${i.phone||''}`,45,195,{width:250});
-  let y=250;doc.fillColor(navy).font('Helvetica-Bold').fontSize(15).text(`${i.service_title||'Invoice'}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}`,45,y,{width:505});y+=30;
-  doc.rect(45,y,505,24).fill('#e7eef5');doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('Product or Service',53,y+8);doc.text('Qty',335,y+8);doc.text('Net',380,y+8);doc.text('VAT',435,y+8);doc.text('Total',485,y+8);y+=30;
-  const showEs=i.invoice_language!=='en';
-  for(const item of items){const label=[item.description_en,showEs&&item.description_es?item.description_es:null].filter(Boolean).join(' / ');doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text(label,53,y,{width:265});doc.fillColor(muted).font('Helvetica').fontSize(7).text([item.detail_en,showEs?item.detail_es:null].filter(Boolean).join(' / '),53,y+12,{width:265});doc.fillColor(navy).fontSize(8).text(String(Number(item.quantity)),337,y);doc.text(euro(item.unit_price_minor),376,y);doc.text(`${Number(item.tax_rate).toFixed(0)}%`,438,y);doc.text(euro(item.line_total_minor),482,y);y+=42;if(y>650){doc.addPage();y=55;}}
-  y+=8;doc.moveTo(330,y).lineTo(550,y).strokeColor('#dce3e6').stroke();y+=10;const vatGroups={};items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});const summary=[['Subtotal',i.subtotal_minor],...Object.entries(vatGroups).map(([r,a])=>[`IVA / VAT ${r}%`,a]),['Tax total',i.tax_minor],['Invoice total',i.total_minor],['Amount paid',i.paid_minor],['Balance due',i.outstanding_minor]];for(const [label,amt] of summary){const final=label==='Balance due';if(final){doc.rect(325,y-4,225,24).fill('#eef4f7');}doc.fillColor(navy).font(final?'Helvetica-Bold':'Helvetica').fontSize(final?11:8).text(label,335,y);doc.text(euro(amt),465,y,{width:75,align:'right'});y+=final?30:20;}
-  if(i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)){doc.fillColor(gold).font('Helvetica-Bold').fontSize(9).text(`Amount due now: ${euro(i.amount_due_now_minor)}`,335,y);y+=24;}
-  if(y>675){doc.addPage();y=55;}doc.moveTo(45,y).lineTo(550,y).strokeColor('#dce3e6').stroke();y+=15;doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('English',45,y);y+=12;doc.fillColor(muted).font('Helvetica').fontSize(7).text(tenant.english_footer||'',45,y,{width:505});y+=55;if(i.bank_transfer_enabled){doc.fillColor(navy).font('Helvetica-Bold').text(`Bank transfer: ${tenant.bank_account_name||''} · IBAN ${tenant.bank_iban||''} · BIC ${tenant.bank_bic||''}`,45,y,{width:505});y+=25;}if(i.invoice_language!=='en'){doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('Español',45,y);y+=12;doc.fillColor(muted).font('Helvetica').fontSize(7).text(tenant.spanish_footer||'',45,y,{width:505});}
-  doc.end();
+  try{
+    const data=await loadInvoice(req.params.id);
+    if(!data)return res.status(404).send('Invoice not found.');
+    const i=data.invoice;
+    if(!i.locked_at)return res.status(400).send('Issue the invoice before downloading the PDF.');
+    const pdf=await buildInvoicePdfBuffer(data);
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Invoice-${i.invoice_number}.pdf"`);
+    res.send(pdf);
+  }catch(err){
+    console.error(err);
+    res.status(500).send(esc(err.message));
+  }
+});
+
+app.post('/invoices/:id/email',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    const data=await loadInvoice(req.params.id);
+    if(!data) throw new Error('Invoice not found.');
+    const {tenant,invoice:i}=data;
+    if(!i.locked_at) throw new Error('Issue the invoice before emailing it.');
+    if(!i.email) throw new Error('This customer does not have an email address.');
+
+    const transporter=getMailTransporter();
+    await transporter.verify();
+
+    const pdf=await buildInvoicePdfBuffer(data);
+    const from=process.env.SMTP_FROM || tenant.email || process.env.SMTP_USER;
+    const subject=`Sotoboats Invoice ${i.invoice_number}`;
+
+    await transporter.sendMail({
+      from,
+      to:i.email,
+      replyTo:tenant.email || undefined,
+      subject,
+      html:invoiceEmailHtml(data),
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nPlease find attached Sotoboats invoice ${i.invoice_number}.\nBalance due: ${euro(i.outstanding_minor)}\nDue date: ${fmtDate(i.due_date)}\n\nPayment details are included on the attached invoice.\n\nThank you,\nSotoboats`,
+      attachments:[{
+        filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
+        content:pdf,
+        contentType:'application/pdf'
+      }]
+    });
+
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE customer_invoices SET emailed_at=now(),emailed_to=$1,updated_at=now() WHERE id=$2 AND tenant_id=$3`,
+      [i.email,i.id,tenant.id]
+    );
+    await client.query(
+      `INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+       VALUES($1,$2,'invoice_emailed','Sotoboats Admin',jsonb_build_object('to',to_jsonb($3::text)))`,
+      [tenant.id,i.id,i.email]
+    );
+    await client.query('COMMIT');
+    res.redirect(`/invoices/${i.id}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    console.error(err);
+    res.status(400).send(shell('Email error','invoices',`<section class="card"><h2>Could not send invoice</h2><p class="sub">${esc(err.message)}</p><div class="actions"><a class="btn" href="/invoices/${req.params.id}">Back to invoice</a></div></section>`));
+  }finally{
+    client.release();
+  }
 });
 
 app.get('/settings',async(req,res)=>{
@@ -310,6 +510,11 @@ async function initialiseDatabase() {
   const schemaPath = path.join(__dirname, 'schema.sql');
   const sql = fs.readFileSync(schemaPath, 'utf8');
   await pool.query(sql);
+  await pool.query(`
+    ALTER TABLE customer_invoices
+      ADD COLUMN IF NOT EXISTS emailed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS emailed_to TEXT;
+  `);
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
 
