@@ -174,17 +174,16 @@ app.get('/invoices',async(req,res)=>{
 
 function lineRowsHtml(items=[]) {
   const rows=items.length?items:[{description_en:'',description_es:'',detail_en:'',detail_es:'',quantity:1,unit_price_minor:0,tax_rate:21}];
-  const presetOptions=`
-    <option value="">Choose a description…</option>
-    <option value="tuition">Private sailing tuition</option>
-    <option value="sunseeker">Charter – Sunseeker</option>
-    <option value="catamaran">Charter – Catamaran</option>
-    <option value="jeanneau">Charter – Jeanneau sail boat</option>
-    <option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>
-    <option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>
-    <option value="subsistence">Subsistence / cleaning / onboard facilities</option>
-    <option value="delivery">Boat delivery</option>
-    <option value="custom">Other / Custom description</option>`;
+  const presetOptions='<option value="">Choose a description…</option>'+
+    '<option value="tuition">Private sailing tuition</option>'+
+    '<option value="sunseeker">Charter – Sunseeker</option>'+
+    '<option value="catamaran">Charter – Catamaran</option>'+
+    '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+
+    '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+
+    '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+
+    '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+
+    '<option value="delivery">Boat delivery</option>'+
+    '<option value="custom">Other / Custom description</option>';
   return rows.map((i,idx)=>`<div class="line-grid line-row">
     <div style="grid-column:1/-1">
       <div class="preset-wrap">
@@ -217,43 +216,43 @@ async function invoiceForm(res, invoice=null, items=[]) {
   const descriptionPresets={
     tuition:{
       type:'hours',
-      en:h=>`Private sailing tuition (departing from Estepona, life jackets provided. Up to ${h||'X'} hour${Number(h)===1?'':'s'} of sailing)`,
-      es:h=>`Clases particulares de vela (salida desde Estepona, chalecos salvavidas incluidos. Hasta ${h||'X'} hora${Number(h)===1?'':'s'} de navegación)`
+      en:function(h){return 'Private sailing tuition (departing from Estepona, life jackets provided. Up to '+(h||'X')+' hour'+(Number(h)===1?'':'s')+' of sailing)';},
+      es:function(h){return 'Clases particulares de vela (salida desde Estepona, chalecos salvavidas incluidos. Hasta '+(h||'X')+' hora'+(Number(h)===1?'':'s')+' de navegación)';}
     },
     sunseeker:{
       type:'hours',
-      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Sunseeker (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
-      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Sunseeker (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+      en:function(h){return (h||'X')+' hour'+(Number(h)===1?'':'s')+' charter – Sunseeker (including Captain, host, snacks, cava, white wine, beer and soft drinks)';},
+      es:function(h){return 'Chárter de '+(h||'X')+' hora'+(Number(h)===1?'':'s')+' – Sunseeker (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)';}
     },
     catamaran:{
       type:'hours',
-      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Catamaran (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
-      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Catamarán (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+      en:function(h){return (h||'X')+' hour'+(Number(h)===1?'':'s')+' charter – Catamaran (including Captain, host, snacks, cava, white wine, beer and soft drinks)';},
+      es:function(h){return 'Chárter de '+(h||'X')+' hora'+(Number(h)===1?'':'s')+' – Catamarán (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)';}
     },
     jeanneau:{
       type:'hours',
-      en:h=>`${h||'X'} hour${Number(h)===1?'':'s'} charter – Jeanneau sail boat (including Captain, host, snacks, cava, white wine, beer and soft drinks)`,
-      es:h=>`Chárter de ${h||'X'} hora${Number(h)===1?'':'s'} – Velero Jeanneau (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)`
+      en:function(h){return (h||'X')+' hour'+(Number(h)===1?'':'s')+' charter – Jeanneau sail boat (including Captain, host, snacks, cava, white wine, beer and soft drinks)';},
+      es:function(h){return 'Chárter de '+(h||'X')+' hora'+(Number(h)===1?'':'s')+' – Velero Jeanneau (incluye patrón, atención a bordo, aperitivos, cava, vino blanco, cerveza y refrescos)';}
     },
     morocco_tuition:{
       type:'fixed',
-      en:()=>`Morocco sailing trip – Sailing tuition`,
-      es:()=>`Viaje a vela a Marruecos – Clases de vela`
+      en:function(){return 'Morocco sailing trip – Sailing tuition';},
+      es:function(){return 'Viaje a vela a Marruecos – Clases de vela';}
     },
     morocco_subsistence:{
       type:'fixed',
-      en:()=>`Morocco sailing trip – Subsistence, cleaning, use of onboard facilities`,
-      es:()=>`Viaje a vela a Marruecos – Manutención, limpieza y uso de las instalaciones a bordo`
+      en:function(){return 'Morocco sailing trip – Subsistence, cleaning, use of onboard facilities';},
+      es:function(){return 'Viaje a vela a Marruecos – Manutención, limpieza y uso de las instalaciones a bordo';}
     },
     subsistence:{
       type:'fixed',
-      en:()=>`Subsistence, cleaning, use of onboard facilities`,
-      es:()=>`Manutención, limpieza y uso de las instalaciones a bordo`
+      en:function(){return 'Subsistence, cleaning, use of onboard facilities';},
+      es:function(){return 'Manutención, limpieza y uso de las instalaciones a bordo';}
     },
     delivery:{
       type:'route',
-      en:(a,b)=>`Boat delivery from ${a||'X'} to ${b||'X'} (excluding fuel, insurance)`,
-      es:(a,b)=>`Traslado de embarcación de ${a||'X'} a ${b||'X'} (combustible y seguro no incluidos)`
+      en:function(a,b){return 'Boat delivery from '+(a||'X')+' to '+(b||'X')+' (excluding fuel, insurance)';},
+      es:function(a,b){return 'Traslado de embarcación de '+(a||'X')+' a '+(b||'X')+' (combustible y seguro no incluidos)';}
     }
   };
 
@@ -274,51 +273,52 @@ async function invoiceForm(res, invoice=null, items=[]) {
   }
 
   function wireLineRow(row){
-    row.querySelector('.remove')?.addEventListener('click',()=>{
+    row.querySelector('.remove')?.addEventListener('click',function(){
       if(document.querySelectorAll('.line-row').length>1) row.remove();
       else {
-        row.querySelectorAll('input[type=text], input:not([type])').forEach(x=>x.value='');
         row.querySelector('.desc-en').value='';
         row.querySelector('.desc-es').value='';
+        row.querySelectorAll('input[name=detail_en],input[name=detail_es],input[name=unit_price]').forEach(function(x){x.value='';});
       }
       calcInvoice();
     });
-    row.querySelector('.description-preset')?.addEventListener('change',()=>updatePreset(row));
-    row.querySelector('.preset-hours')?.addEventListener('input',()=>updatePreset(row));
-    row.querySelector('.preset-from')?.addEventListener('input',()=>updatePreset(row));
-    row.querySelector('.preset-to')?.addEventListener('input',()=>updatePreset(row));
-    row.querySelectorAll('input,select').forEach(x=>x.addEventListener('input',calcInvoice));
+    row.querySelector('.description-preset')?.addEventListener('change',function(){updatePreset(row);});
+    row.querySelector('.preset-hours')?.addEventListener('input',function(){updatePreset(row);});
+    row.querySelector('.preset-from')?.addEventListener('input',function(){updatePreset(row);});
+    row.querySelector('.preset-to')?.addEventListener('input',function(){updatePreset(row);});
+    row.querySelectorAll('input,select').forEach(function(x){x.addEventListener('input',calcInvoice);});
   }
 
   function addLine(){
     const wrap=document.getElementById('lineRows');
     const d=document.createElement('div');
     d.className='line-grid line-row';
-    d.innerHTML=`<div style="grid-column:1/-1">
-      <div class="preset-wrap">
-        <label>Description template<select class="description-preset">
-          <option value="">Choose a description…</option>
-          <option value="tuition">Private sailing tuition</option>
-          <option value="sunseeker">Charter – Sunseeker</option>
-          <option value="catamaran">Charter – Catamaran</option>
-          <option value="jeanneau">Charter – Jeanneau sail boat</option>
-          <option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>
-          <option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>
-          <option value="subsistence">Subsistence / cleaning / onboard facilities</option>
-          <option value="delivery">Boat delivery</option>
-          <option value="custom">Other / Custom description</option>
-        </select></label>
-        <label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="e.g. 4"></label>
-        <label class="from-wrap">From<input class="preset-from" placeholder="e.g. Estepona"></label>
-        <label class="to-wrap">To<input class="preset-to" placeholder="e.g. Ibiza"></label>
-      </div>
-    </div>
-    <div><label>English description<input class="desc-en" name="description_en" required></label><label style="margin-top:6px">English detail<input name="detail_en"></label></div>
-    <div><label>Spanish description<input class="desc-es" name="description_es"></label><label style="margin-top:6px">Spanish detail<input name="detail_es"></label></div>
-    <label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="1" required></label>
-    <label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="0.00" required></label>
-    <label>VAT<select name="tax_rate"><option value="0">0%</option><option value="10">10%</option><option value="21" selected>21%</option></select></label>
-    <button class="remove" type="button">×</button>`;
+    d.innerHTML=
+      '<div style="grid-column:1/-1">'+
+        '<div class="preset-wrap">'+
+          '<label>Description template<select class="description-preset">'+
+            '<option value="">Choose a description…</option>'+
+            '<option value="tuition">Private sailing tuition</option>'+
+            '<option value="sunseeker">Charter – Sunseeker</option>'+
+            '<option value="catamaran">Charter – Catamaran</option>'+
+            '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+
+            '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+
+            '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+
+            '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+
+            '<option value="delivery">Boat delivery</option>'+
+            '<option value="custom">Other / Custom description</option>'+
+          '</select></label>'+
+          '<label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="e.g. 4"></label>'+
+          '<label class="from-wrap">From<input class="preset-from" placeholder="e.g. Estepona"></label>'+
+          '<label class="to-wrap">To<input class="preset-to" placeholder="e.g. Ibiza"></label>'+
+        '</div>'+
+      '</div>'+
+      '<div><label>English description<input class="desc-en" name="description_en" required></label><label style="margin-top:6px">English detail<input name="detail_en"></label></div>'+
+      '<div><label>Spanish description<input class="desc-es" name="description_es"></label><label style="margin-top:6px">Spanish detail<input name="detail_es"></label></div>'+
+      '<label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="1" required></label>'+
+      '<label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="0.00" required></label>'+
+      '<label>VAT<select name="tax_rate"><option value="0">0%</option><option value="10">10%</option><option value="21" selected>21%</option></select></label>'+
+      '<button class="remove" type="button">×</button>';
     wrap.appendChild(d);
     wireLineRow(d);
     calcInvoice();
@@ -326,7 +326,7 @@ async function invoiceForm(res, invoice=null, items=[]) {
 
   function calcInvoice(){
     let net=0,vat=0;
-    document.querySelectorAll('.line-row').forEach(r=>{
+    document.querySelectorAll('.line-row').forEach(function(r){
       const q=parseFloat(r.querySelector('[name=quantity]').value)||0;
       const p=parseFloat(r.querySelector('[name=unit_price]').value)||0;
       const t=parseFloat(r.querySelector('[name=tax_rate]').value)||0;
