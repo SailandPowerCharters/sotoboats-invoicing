@@ -151,12 +151,61 @@ async function loadInvoice(id) {
   return { tenant, invoice, items:items.rows, payments:payments.rows, events:events.rows };
 }
 
+
+async function loadCreditNote(id) {
+  const tenant=await getTenant();
+  const note=(await pool.query(`
+    SELECT cn.*,
+      COALESCE(cn.snapshot_contact_name,c.contact_name) AS contact_name,
+      COALESCE(cn.snapshot_company_name,c.company_name) AS company_name,
+      COALESCE(cn.snapshot_email,c.email) AS email,
+      COALESCE(cn.snapshot_phone,c.phone) AS phone,
+      COALESCE(cn.snapshot_billing_address_1,c.billing_address_1) AS billing_address_1,
+      COALESCE(cn.snapshot_billing_address_2,c.billing_address_2) AS billing_address_2,
+      COALESCE(cn.snapshot_billing_city,c.billing_city) AS billing_city,
+      COALESCE(cn.snapshot_billing_region,c.billing_region) AS billing_region,
+      COALESCE(cn.snapshot_billing_postcode,c.billing_postcode) AS billing_postcode,
+      COALESCE(cn.snapshot_billing_country_code,c.billing_country_code) AS billing_country_code,
+      COALESCE(cn.snapshot_tax_number,c.tax_number) AS tax_number,
+      COALESCE(cn.snapshot_identity_type,c.identity_type) AS identity_type,
+      COALESCE(cn.snapshot_identity_number,c.identity_number) AS identity_number,
+      inv.invoice_number AS original_invoice_number,
+      inv.total_minor AS original_invoice_total_minor,
+      inv.paid_minor AS original_invoice_paid_minor,
+      inv.credited_minor AS original_invoice_credited_minor
+    FROM customer_credit_notes cn
+    JOIN invoice_customers c ON c.id=cn.customer_id
+    JOIN customer_invoices inv ON inv.id=cn.original_invoice_id
+    WHERE cn.id=$1 AND cn.tenant_id=$2
+  `,[id,tenant.id])).rows[0];
+  if(!note) return null;
+  const items=(await pool.query(`SELECT * FROM customer_credit_note_items WHERE credit_note_id=$1 ORDER BY sort_order`,[id])).rows;
+  return {tenant,note,items};
+}
+
+async function issuedCreditsForInvoice(invoiceId, excludeCreditNoteId=null, client=pool) {
+  const params=[invoiceId];
+  let where=`original_invoice_id=$1 AND status='issued'`;
+  if(excludeCreditNoteId){
+    params.push(excludeCreditNoteId);
+    where+=` AND id<>$2`;
+  }
+  const r=await client.query(`SELECT COALESCE(SUM(total_minor),0)::bigint n FROM customer_credit_notes WHERE ${where}`,params);
+  return Number(r.rows[0].n||0);
+}
+
+function creditStatusPill(status) {
+  const cls=status==='issued'?'green':status==='cancelled'?'red':'';
+  return `<span class="pill ${cls}">${esc(status||'draft')}</span>`;
+}
+
 const nav = (active) => `
   <aside class="side">
     <div class="brand"><span class="mark">S</span><div><strong>SOTOBOATS</strong><small>INVOICING · YDP PILOT</small></div></div>
     <nav>
       <a class="${active==='dashboard'?'active':''}" href="/">Dashboard</a>
       <a class="${active==='invoices'?'active':''}" href="/invoices">Invoices</a>
+      <a class="${active==='credit-notes'?'active':''}" href="/credit-notes">Credit Notes</a>
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
@@ -827,7 +876,7 @@ function invoicePreview(data){
   const vatGroups={}; items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});
   const identity=i.identity_number?`<p>${esc(i.identity_type||'ID')}: ${esc(i.identity_number)}</p>`:'';
   const rows=items.map(x=>`<tr><td><strong>${showEn?esc(x.description_en):esc(x.description_es||x.description_en)}</strong>${showEn&&x.detail_en?`<br><span class="muted">${esc(x.detail_en)}</span>`:''}${showEs&&x.description_es?`<br><span class="muted">${esc(x.description_es)}</span>`:''}${showEs&&x.detail_es?`<br><span class="muted">${esc(x.detail_es)}</span>`:''}</td><td>${Number(x.quantity)}</td><td>${euro(x.unit_price_minor)}</td><td>${Number(x.tax_rate).toFixed(0)}%</td><td>${euro(x.line_total_minor)}</td></tr>`).join('');
-  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div><div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
+  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div>${Number(i.credited_minor||0)>0?`<div class="summary-row"><span>Credit notes</span><strong>-${euro(i.credited_minor)}</strong></div>`:''}<div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${Number(i.paid_minor||0)+Number(i.credited_minor||0)>Number(i.total_minor||0)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Customer credit / refund due</span><strong>${euro(Number(i.paid_minor)+Number(i.credited_minor)-Number(i.total_minor))}</strong></div>`:''}${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
 }
 
 
@@ -987,13 +1036,16 @@ function buildInvoicePdfBuffer(data) {
         ['Tax total',i.tax_minor],
         ['Invoice total',i.total_minor],
         ['Amount paid',i.paid_minor],
-        ['Balance due',i.outstanding_minor]
+        ...(Number(i.credited_minor||0)>0?[['Credit notes',-Number(i.credited_minor)]]:[]),
+        ['Balance due',i.outstanding_minor],
+        ...((Number(i.paid_minor||0)+Number(i.credited_minor||0)>Number(i.total_minor||0))?[['Customer credit / refund due',Number(i.paid_minor)+Number(i.credited_minor)-Number(i.total_minor)]]:[])
       ];
       for(const [label,amt] of summary){
         const final=label==='Balance due';
         if(final) doc.rect(325,y-4,225,24).fill('#eef4f7');
         doc.fillColor(navy).font(final?'Helvetica-Bold':'Helvetica').fontSize(final?11:8).text(label,335,y);
-        doc.text(euro(amt),465,y,{width:75,align:'right'});
+        const displayAmt=Number(amt)<0?'-'+euro(Math.abs(Number(amt))):euro(amt);
+        doc.text(displayAmt,465,y,{width:75,align:'right'});
         y+=final?30:20;
       }
 
@@ -1025,13 +1077,31 @@ function buildInvoicePdfBuffer(data) {
 }
 
 app.get('/invoices/:id',async(req,res)=>{
-  const data=await loadInvoice(req.params.id); if(!data)return res.status(404).send('Invoice not found.'); const i=data.invoice;
+  const data=await loadInvoice(req.params.id);
+  if(!data)return res.status(404).send('Invoice not found.');
+  const i=data.invoice;
+
+  const creditNotes=(await pool.query(`
+    SELECT * FROM customer_credit_notes
+    WHERE original_invoice_id=$1 AND tenant_id=$2
+    ORDER BY created_at DESC
+  `,[i.id,data.tenant.id])).rows;
+  const issuedCredits=creditNotes.filter(c=>c.status==='issued').reduce((s,c)=>s+Number(c.total_minor||0),0);
+  const remainingCredit=Math.max(0,Number(i.total_minor||0)-issuedCredits);
+
   const emailBtn=i.locked_at&&i.email?`<form method="post" action="/invoices/${i.id}/email" onsubmit="return confirm('${i.emailed_at?'Resend':'Send'} invoice ${esc(i.invoice_number||'')} to ${esc(i.email)}?');"><button class="btn gold">${i.emailed_at?'Resend invoice':'Send invoice'}</button></form>`:'';
   const reminderBtn=i.locked_at&&i.email&&Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/remind" onsubmit="return confirm('Send a friendly payment reminder to ${esc(i.email)}?');"><button class="btn light">Send reminder</button></form>`:'';
-  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}${reminderBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
+  const creditBtn=i.locked_at&&remainingCredit>0?`<a class="btn light" href="/invoices/${i.id}/credit-note">Create credit note</a>`:'';
+
+  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}${reminderBtn}${creditBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
+
   const payment=i.locked_at&&Number(i.outstanding_minor)>0?`<section class="card no-print"><h2>Record payment</h2><form method="post" action="/invoices/${i.id}/payments"><div class="form-grid three"><label>Amount €<input type="number" step="0.01" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" name="amount" value="${major(i.amount_due_now_minor??i.outstanding_minor).toFixed(2)}" required></label><label>Method<select name="method"><option value="bank_transfer">Bank transfer</option><option value="cash">Cash</option><option value="card_external">Card - external</option><option value="other">Other</option></select></label><label>Reference<input name="reference"></label></div><div class="actions" style="margin-top:12px"><button class="btn gold">Record payment</button></div></form></section>`:'';
+
+  const credits=creditNotes.length?`<section class="card no-print"><h2>Credit notes</h2><div class="table-wrap"><table><thead><tr><th>Credit note</th><th>Date</th><th>Reason</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${creditNotes.map(c=>`<tr><td><strong>${esc(c.credit_note_number||'Draft')}</strong></td><td>${fmtDate(c.issue_date||c.created_at)}</td><td>${esc(c.reason||'')}</td><td>${euro(c.total_minor)}</td><td>${creditStatusPill(c.status)}</td><td><a class="btn light" href="/credit-notes/${c.id}">Open</a></td></tr>`).join('')}</tbody></table></div></section>`:'';
+
   const audit=data.events.length?`<section class="card no-print"><h2>Audit trail</h2><div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>Actor</th></tr></thead><tbody>${data.events.map(e=>`<tr><td>${fmtDate(e.created_at)}</td><td>${esc(e.event_type.replaceAll('_',' '))}</td><td>${esc(e.actor_name||'System')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
-  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${payment}${audit}`,i.locked_at?'Issued invoices are locked. Payments can still be recorded.':'This is a draft and can still be edited.'));
+
+  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${payment}${credits}${audit}`,i.locked_at?'Issued invoices are locked. Payments and credit notes can still be recorded.':'This is a draft and can still be edited.'));
 });
 
 app.post('/invoices/:id/issue',async(req,res)=>{
@@ -1210,6 +1280,382 @@ app.post('/invoices/:id/remind',async(req,res)=>{
   }
 });
 
+
+function creditNoteRowsHtml(items=[]) {
+  return items.map((x,idx)=>`<div class="line-grid credit-line-row">
+    <div>
+      <label>English description<input name="description_en" value="${esc(x.description_en||'')}" required></label>
+      <label style="margin-top:6px">English detail<input name="detail_en" value="${esc(x.detail_en||'')}"></label>
+    </div>
+    <div>
+      <label>Spanish description<input name="description_es" value="${esc(x.description_es||'')}"></label>
+      <label style="margin-top:6px">Spanish detail<input name="detail_es" value="${esc(x.detail_es||'')}"></label>
+    </div>
+    <label>Qty<input type="number" min="0" step="0.001" name="quantity" value="${Number(x.quantity||0)}"></label>
+    <label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="${major(x.unit_price_minor||0).toFixed(2)}"></label>
+    <label>VAT<input value="${Number(x.tax_rate).toFixed(0)}%" disabled><input type="hidden" name="tax_rate" value="${Number(x.tax_rate)}"></label>
+    <input type="hidden" name="original_item_id" value="${esc(x.original_item_id||x.id||'')}">
+  </div>`).join('');
+}
+
+function creditNoteForm(data, note=null, noteItems=[]) {
+  const {tenant,invoice,items}=data;
+  const edit=!!note;
+  const rows=edit?noteItems:items.map(x=>({
+    original_item_id:x.id,
+    description_en:x.description_en,
+    description_es:x.description_es,
+    detail_en:x.detail_en,
+    detail_es:x.detail_es,
+    quantity:x.quantity,
+    unit_price_minor:x.unit_price_minor,
+    tax_rate:x.tax_rate
+  }));
+  const today=new Date().toISOString().slice(0,10);
+  const action=edit?`/credit-notes/${note.id}/edit`:`/invoices/${invoice.id}/credit-note`;
+  return `<section class="form-card">
+    <div class="actions" style="justify-content:space-between">
+      <div>
+        <h2>${edit?'Edit credit note draft':'Create credit note'}</h2>
+        <p class="sub">Against invoice <strong>${esc(invoice.invoice_number||'')}</strong>. Set quantities to zero for lines you are not crediting.</p>
+      </div>
+      <a class="btn light" href="/invoices/${invoice.id}">Back to invoice</a>
+    </div>
+    <form method="post" action="${action}" id="creditNoteForm">
+      <div class="form-grid three">
+        <label>Issue date<input type="date" name="issue_date" value="${iso(note?.issue_date)||today}" required></label>
+        <label>Language<select name="invoice_language"><option value="bilingual" ${note?.invoice_language==='bilingual'||!note?'selected':''}>Bilingual</option><option value="en" ${note?.invoice_language==='en'?'selected':''}>English</option><option value="es" ${note?.invoice_language==='es'?'selected':''}>Spanish</option></select></label>
+        <label>Reason<input name="reason" value="${esc(note?.reason||'')}" placeholder="e.g. Booking cancelled / service adjustment" required></label>
+        <label class="full">Notes<textarea name="notes">${esc(note?.notes||'')}</textarea></label>
+      </div>
+      <section class="card" style="margin-top:16px;background:#fbfcfc">
+        <h2>Credit lines</h2>
+        <div id="creditRows">${creditNoteRowsHtml(rows)}</div>
+        <div class="totals">
+          <div class="totals-row"><span>Net credit</span><strong id="creditNet">€0.00</strong></div>
+          <div class="totals-row"><span>VAT credit</span><strong id="creditVat">€0.00</strong></div>
+          <div class="totals-row final"><span>Total credit</span><strong id="creditTotal">€0.00</strong></div>
+        </div>
+      </section>
+      <div class="actions" style="margin-top:15px"><button class="btn gold">Save credit note draft</button></div>
+    </form>
+  </section>
+  <script>
+    function calcCredit(){
+      let net=0,vat=0;
+      document.querySelectorAll('.credit-line-row').forEach(function(r){
+        const q=parseFloat(r.querySelector('[name=quantity]').value)||0;
+        const p=parseFloat(r.querySelector('[name=unit_price]').value)||0;
+        const t=parseFloat(r.querySelector('[name=tax_rate]').value)||0;
+        const n=q*p; net+=n; vat+=n*t/100;
+      });
+      document.getElementById('creditNet').textContent='€'+net.toFixed(2);
+      document.getElementById('creditVat').textContent='€'+vat.toFixed(2);
+      document.getElementById('creditTotal').textContent='€'+(net+vat).toFixed(2);
+    }
+    document.getElementById('creditNoteForm').addEventListener('input',calcCredit);
+    calcCredit();
+  </script>`;
+}
+
+async function saveCreditNote(req,res,existingId=null) {
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const b=req.body;
+
+    let invoiceId=req.params.id;
+    if(existingId){
+      const existing=(await client.query(`SELECT * FROM customer_credit_notes WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[existingId,tenant.id])).rows[0];
+      if(!existing) throw new Error('Credit note not found.');
+      if(existing.locked_at) throw new Error('Issued credit notes are locked.');
+      invoiceId=existing.original_invoice_id;
+    }
+
+    const invoice=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2`,[invoiceId,tenant.id])).rows[0];
+    if(!invoice || !invoice.locked_at) throw new Error('Credit notes can only be created against an issued invoice.');
+
+    const descEn=Array.isArray(b.description_en)?b.description_en:[b.description_en];
+    const descEs=Array.isArray(b.description_es)?b.description_es:[b.description_es];
+    const detEn=Array.isArray(b.detail_en)?b.detail_en:[b.detail_en];
+    const detEs=Array.isArray(b.detail_es)?b.detail_es:[b.detail_es];
+    const qty=Array.isArray(b.quantity)?b.quantity:[b.quantity];
+    const price=Array.isArray(b.unit_price)?b.unit_price:[b.unit_price];
+    const tax=Array.isArray(b.tax_rate)?b.tax_rate:[b.tax_rate];
+    const origIds=Array.isArray(b.original_item_id)?b.original_item_id:[b.original_item_id];
+
+    const lines=[];
+    for(let n=0;n<descEn.length;n++){
+      const q=Number(qty[n]||0);
+      if(q<=0) continue;
+      const c=calculateLine(q,price[n],tax[n]);
+      if(c.total<=0) continue;
+      lines.push({
+        original_item_id:origIds[n]||null,
+        description_en:String(descEn[n]||'').trim(),
+        description_es:String(descEs[n]||'').trim()||null,
+        detail_en:String(detEn[n]||'').trim()||null,
+        detail_es:String(detEs[n]||'').trim()||null,
+        tax_rate:Number(tax[n]||0),
+        ...c
+      });
+    }
+    if(!lines.length) throw new Error('Credit at least one invoice line.');
+
+    const subtotal=lines.reduce((s,l)=>s+l.net,0);
+    const vat=lines.reduce((s,l)=>s+l.tax,0);
+    const total=subtotal+vat;
+
+    const alreadyIssued=await issuedCreditsForInvoice(invoice.id,existingId,client);
+    const remaining=Math.max(0,Number(invoice.total_minor)-alreadyIssued);
+    if(total>remaining) throw new Error(`Credit note exceeds the remaining creditable amount of ${euro(remaining)}.`);
+
+    let creditNoteId=existingId;
+    if(existingId){
+      await client.query(`
+        UPDATE customer_credit_notes SET invoice_language=$1,issue_date=$2,reason=$3,notes=$4,
+          subtotal_minor=$5,tax_minor=$6,total_minor=$7,updated_at=now()
+        WHERE id=$8 AND tenant_id=$9
+      `,[b.invoice_language||'bilingual',b.issue_date||null,b.reason,b.notes||null,subtotal,vat,total,existingId,tenant.id]);
+      await client.query(`DELETE FROM customer_credit_note_items WHERE credit_note_id=$1`,[existingId]);
+    }else{
+      creditNoteId=(await client.query(`
+        INSERT INTO customer_credit_notes(
+          tenant_id,original_invoice_id,customer_id,invoice_language,issue_date,reason,notes,
+          subtotal_minor,tax_minor,total_minor
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id
+      `,[tenant.id,invoice.id,invoice.customer_id,b.invoice_language||'bilingual',b.issue_date||null,b.reason,b.notes||null,subtotal,vat,total])).rows[0].id;
+    }
+
+    for(let n=0;n<lines.length;n++){
+      const l=lines[n];
+      await client.query(`
+        INSERT INTO customer_credit_note_items(
+          credit_note_id,original_item_id,sort_order,description_en,description_es,detail_en,detail_es,
+          quantity,unit_price_minor,tax_rate,line_net_minor,line_tax_minor,line_total_minor
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      `,[creditNoteId,l.original_item_id,n,l.description_en,l.description_es,l.detail_en,l.detail_es,l.qty,l.unit,l.tax_rate,l.net,l.tax,l.total]);
+    }
+
+    await client.query('COMMIT');
+    res.redirect(`/credit-notes/${creditNoteId}`);
+  }catch(err){
+    await client.query('ROLLBACK');
+    res.status(400).send(shell('Credit note error','credit-notes',`<section class="card"><h2>Could not save credit note</h2><p class="sub">${esc(err.message)}</p><div class="actions"><a class="btn light" href="javascript:history.back()">Go back</a></div></section>`));
+  }finally{
+    client.release();
+  }
+}
+
+app.get('/invoices/:id/credit-note',async(req,res)=>{
+  const data=await loadInvoice(req.params.id);
+  if(!data)return res.status(404).send('Invoice not found.');
+  if(!data.invoice.locked_at)return res.status(400).send('Issue the invoice first.');
+  const issued=await issuedCreditsForInvoice(data.invoice.id);
+  if(issued>=Number(data.invoice.total_minor)) return res.status(400).send('This invoice has already been fully credited.');
+  res.send(shell('Create Credit Note','credit-notes',creditNoteForm(data),'Credit an issued invoice without altering the original document.'));
+});
+app.post('/invoices/:id/credit-note',(req,res)=>saveCreditNote(req,res));
+
+app.get('/credit-notes',async(req,res)=>{
+  const tenant=await getTenant();
+  const rows=(await pool.query(`
+    SELECT cn.*,i.invoice_number,c.contact_name,c.company_name
+    FROM customer_credit_notes cn
+    JOIN customer_invoices i ON i.id=cn.original_invoice_id
+    JOIN invoice_customers c ON c.id=cn.customer_id
+    WHERE cn.tenant_id=$1
+    ORDER BY cn.created_at DESC
+  `,[tenant.id])).rows;
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Credit note</th><th>Original invoice</th><th>Customer</th><th>Reason</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td><strong>${esc(r.credit_note_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.issue_date||r.created_at)}</span></td><td><a href="/invoices/${r.original_invoice_id}">${esc(r.invoice_number||'')}</a></td><td>${esc(r.company_name||r.contact_name)}</td><td>${esc(r.reason||'')}</td><td>${euro(r.total_minor)}</td><td>${creditStatusPill(r.status)}</td><td><a class="btn light" href="/credit-notes/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No credit notes yet.</p>';
+  res.send(shell('Credit Notes','credit-notes',`<section class="card"><h2>Credit notes</h2>${table}</section>`,'Corrections and credits linked to issued invoices.'));
+});
+
+function creditNotePreview(data){
+  const {tenant,note:n,items}=data;
+  const showEn=n.invoice_language!=='es',showEs=n.invoice_language!=='en';
+  const vatGroups={};items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});
+  const identity=n.identity_number?`<p>${esc(n.identity_type||'ID')}: ${esc(n.identity_number)}</p>`:'';
+  const rows=items.map(x=>`<tr><td><strong>${showEn?esc(x.description_en):esc(x.description_es||x.description_en)}</strong>${showEs&&x.description_es?`<br><span class="muted">${esc(x.description_es)}</span>`:''}</td><td>${Number(x.quantity)}</td><td>${euro(x.unit_price_minor)}</td><td>${Number(x.tax_rate).toFixed(0)}%</td><td>-${euro(x.line_total_minor)}</td></tr>`).join('');
+  return `<div class="invoice-sheet">
+    <div class="invoice-head">
+      <div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div>
+      <div class="invoice-meta"><strong>Credit Note / Abono ${esc(n.credit_note_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(n.issue_date)}</p><p>Original invoice / Factura: ${esc(n.original_invoice_number||'')}</p></div>
+    </div>
+    <div class="billto"><div><div class="eyebrow">Credit to / Abonar a</div><p><strong>${esc(n.company_name||n.contact_name)}</strong></p>${n.company_name?`<p>${esc(n.contact_name)}</p>`:''}<p>${esc([n.billing_address_1,n.billing_address_2,n.billing_city,n.billing_region,n.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(n.email||'')}</p><p>${esc(n.phone||'')}</p>${n.tax_number?`<p>Tax ID: ${esc(n.tax_number)}</p>`:''}</div></div>
+    <h3 class="invoice-title">Credit note for invoice ${esc(n.original_invoice_number||'')}</h3>
+    <div class="lang-block"><strong>Reason / Motivo:</strong> ${esc(n.reason||'')}</div>
+    <table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Credit</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="invoice-summary">
+      <div class="summary-row"><span>Net credit</span><strong>-${euro(n.subtotal_minor)}</strong></div>
+      ${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>-${euro(amt)}</strong></div>`).join('')}
+      <div class="summary-row final"><span>Total credit</span><strong>-${euro(n.total_minor)}</strong></div>
+    </div>
+    ${n.notes?`<div class="lang-block"><strong>Notes</strong><p>${esc(n.notes)}</p></div>`:''}
+  </div>`;
+}
+
+function buildCreditNotePdfBuffer(data){
+  return new Promise((resolve,reject)=>{
+    try{
+      const {tenant,note:n,items}=data;
+      const chunks=[];
+      const doc=new PDFDocument({size:'A4',margin:45});
+      doc.on('data',c=>chunks.push(c));doc.on('end',()=>resolve(Buffer.concat(chunks)));doc.on('error',reject);
+      const navy='#0b1d2f',gold='#caa86d',muted='#667783';
+      const logoPath=path.join(__dirname,'public','sotoboats-logo.png');
+      if(fs.existsSync(logoPath))doc.image(logoPath,45,42,{width:215});else doc.fillColor(navy).font('Helvetica-Bold').fontSize(25).text('SOTOBOATS',45,45);
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(`${tenant.legal_name}\n${tenant.address_1||''}\n${tenant.postcode||''} ${tenant.city||''}, ${tenant.region||''}\n${tenant.country_name||''}\n${tenant.email||''} · ${tenant.phone||''}\nCompany ID: ${tenant.tax_id||''}`,45,90,{width:250});
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(14).text(`Credit Note / Abono ${n.credit_note_number}`,330,48,{width:220,align:'right'});
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(`Issue date: ${fmtDate(n.issue_date)}\nOriginal invoice: ${n.original_invoice_number}`,330,72,{width:220,align:'right'});
+      doc.moveTo(45,150).lineTo(550,150).strokeColor('#dce3e6').stroke();
+      doc.fillColor(gold).font('Helvetica-Bold').fontSize(8).text('CREDIT TO / ABONAR A',45,166);
+      doc.fillColor(navy).fontSize(10).text(n.company_name||n.contact_name,45,180);
+      const lines=[
+        n.company_name?n.contact_name:null,
+        [n.billing_address_1,n.billing_address_2,n.billing_city,n.billing_region,n.billing_postcode].filter(Boolean).join(', '),
+        n.identity_number?`${n.identity_type||'ID'}: ${n.identity_number}`:null,
+        n.email||null,n.phone||null
+      ].filter(Boolean).join('\n');
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(lines,45,195,{width:250});
+      let y=250;
+      doc.fillColor(navy).font('Helvetica-Bold').fontSize(14).text(`Credit note for invoice ${n.original_invoice_number}`,45,y,{width:505});y+=25;
+      doc.fillColor(muted).font('Helvetica').fontSize(8).text(`Reason: ${n.reason}`,45,y,{width:505});y+=25;
+      doc.rect(45,y,505,24).fill('#e7eef5');doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text('Product or Service',53,y+8);doc.text('Qty',335,y+8);doc.text('Net',380,y+8);doc.text('VAT',435,y+8);doc.text('Credit',485,y+8);y+=30;
+      for(const item of items){
+        const label=[item.description_en,n.invoice_language!=='en'&&item.description_es?item.description_es:null].filter(Boolean).join(' / ');
+        doc.fillColor(navy).font('Helvetica-Bold').fontSize(8).text(label,53,y,{width:265});
+        doc.fillColor(navy).font('Helvetica').fontSize(8).text(String(Number(item.quantity)),337,y);doc.text(euro(item.unit_price_minor),376,y);doc.text(`${Number(item.tax_rate).toFixed(0)}%`,438,y);doc.text('-'+euro(item.line_total_minor),482,y);
+        y+=35;if(y>650){doc.addPage();y=55;}
+      }
+      y+=10;doc.moveTo(330,y).lineTo(550,y).strokeColor('#dce3e6').stroke();y+=12;
+      doc.fillColor(navy).font('Helvetica').fontSize(8).text('Net credit',335,y);doc.text('-'+euro(n.subtotal_minor),465,y,{width:75,align:'right'});y+=20;
+      doc.text('VAT credit',335,y);doc.text('-'+euro(n.tax_minor),465,y,{width:75,align:'right'});y+=20;
+      doc.rect(325,y-4,225,24).fill('#eef4f7');doc.fillColor(navy).font('Helvetica-Bold').fontSize(11).text('Total credit',335,y);doc.text('-'+euro(n.total_minor),465,y,{width:75,align:'right'});
+      doc.end();
+    }catch(err){reject(err);}
+  });
+}
+
+app.get('/credit-notes/:id',async(req,res)=>{
+  const data=await loadCreditNote(req.params.id);
+  if(!data)return res.status(404).send('Credit note not found.');
+  const n=data.note;
+  const emailBtn=n.locked_at&&n.email?`<form method="post" action="/credit-notes/${n.id}/email"><button class="btn gold">${n.emailed_at?'Resend credit note':'Send credit note'}</button></form>`:'';
+  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!n.locked_at?`<a class="btn light" href="/credit-notes/${n.id}/edit">Edit draft</a><form method="post" action="/credit-notes/${n.id}/issue" onsubmit="return confirm('Issue this credit note? Once issued it will be locked and the original invoice balance will be adjusted.');"><button class="btn gold">Issue credit note</button></form>`:`<a class="btn light" target="_blank" href="/credit-notes/${n.id}/pdf">Download PDF</a>${emailBtn}`}<a class="btn light" href="/invoices/${n.original_invoice_id}">Original invoice</a><a class="btn light" href="/credit-notes">Back to credit notes</a></div>`;
+  res.send(shell(n.credit_note_number||'Draft Credit Note','credit-notes',`${controls}${creditNotePreview(data)}`,n.locked_at?'Issued credit notes are locked.':'Draft credit note — still editable.'));
+});
+
+app.get('/credit-notes/:id/edit',async(req,res)=>{
+  const cn=await loadCreditNote(req.params.id);
+  if(!cn)return res.status(404).send('Credit note not found.');
+  if(cn.note.locked_at)return res.redirect(`/credit-notes/${cn.note.id}`);
+  const invoiceData=await loadInvoice(cn.note.original_invoice_id);
+  res.send(shell('Edit Credit Note','credit-notes',creditNoteForm(invoiceData,cn.note,cn.items),'Edit before issuing.'));
+});
+app.post('/credit-notes/:id/edit',(req,res)=>saveCreditNote(req,res,req.params.id));
+
+app.post('/credit-notes/:id/issue',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const cn=(await client.query(`SELECT * FROM customer_credit_notes WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];
+    if(!cn)throw new Error('Credit note not found.');
+    if(cn.locked_at)throw new Error('Credit note has already been issued.');
+    const invoice=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[cn.original_invoice_id,tenant.id])).rows[0];
+    if(!invoice)throw new Error('Original invoice not found.');
+
+    const otherCredits=await issuedCreditsForInvoice(invoice.id,cn.id,client);
+    if(otherCredits+Number(cn.total_minor)>Number(invoice.total_minor))throw new Error('This credit would exceed the original invoice total.');
+
+    const customer=(await client.query(`SELECT * FROM invoice_customers WHERE id=$1 AND tenant_id=$2`,[cn.customer_id,tenant.id])).rows[0];
+    const t=(await client.query(`SELECT * FROM invoice_tenants WHERE id=$1 FOR UPDATE`,[tenant.id])).rows[0];
+    const number=`${t.credit_note_prefix||'CN-'}${String(t.next_credit_note_number||1).padStart(Number(t.credit_note_padding||6),'0')}`;
+    const issue=cn.issue_date||new Date().toISOString().slice(0,10);
+
+    await client.query(`
+      UPDATE customer_credit_notes SET
+        credit_note_number=$1,status='issued',issue_date=$2,issued_at=now(),locked_at=now(),updated_at=now(),
+        snapshot_contact_name=$3,snapshot_company_name=$4,snapshot_email=$5,snapshot_phone=$6,
+        snapshot_billing_address_1=$7,snapshot_billing_address_2=$8,snapshot_billing_city=$9,
+        snapshot_billing_region=$10,snapshot_billing_postcode=$11,snapshot_billing_country_code=$12,
+        snapshot_tax_number=$13,snapshot_identity_type=$14,snapshot_identity_number=$15
+      WHERE id=$16
+    `,[number,issue,customer.contact_name||null,customer.company_name||null,customer.email||null,customer.phone||null,customer.billing_address_1||null,customer.billing_address_2||null,customer.billing_city||null,customer.billing_region||null,customer.billing_postcode||null,customer.billing_country_code||null,customer.tax_number||null,customer.identity_type||null,customer.identity_number||null,cn.id]);
+
+    await client.query(`UPDATE invoice_tenants SET next_credit_note_number=next_credit_note_number+1,updated_at=now() WHERE id=$1`,[tenant.id]);
+
+    const credits=otherCredits+Number(cn.total_minor);
+    const outstanding=Math.max(0,Number(invoice.total_minor)-Number(invoice.paid_minor)-credits);
+    let status=invoice.status;
+    if(credits>=Number(invoice.total_minor))status='credited';
+    else if(outstanding===0&&Number(invoice.paid_minor)>0)status='paid';
+    else if(Number(invoice.paid_minor)>0||credits>0)status='part_paid';
+    else status=invoice.due_date&&dateYmd(invoice.due_date)<new Date().toISOString().slice(0,10)?'overdue':'sent';
+
+    await client.query(`
+      UPDATE customer_invoices
+      SET credited_minor=$1,outstanding_minor=$2,amount_due_now_minor=LEAST(COALESCE(amount_due_now_minor,$2),$2),status=$3,updated_at=now()
+      WHERE id=$4
+    `,[credits,outstanding,status,invoice.id]);
+
+    await client.query(`
+      INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+      VALUES($1,$2,'credit_note_issued','Sotoboats Admin',
+        jsonb_build_object('credit_note_number',to_jsonb($3::text),'credit_minor',to_jsonb($4::bigint)))
+    `,[tenant.id,invoice.id,number,Number(cn.total_minor)]);
+
+    await client.query('COMMIT');
+    res.redirect(`/credit-notes/${cn.id}`);
+  }catch(err){
+    await client.query('ROLLBACK');
+    res.status(400).send(shell('Credit note error','credit-notes',`<section class="card"><h2>Could not issue credit note</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/credit-notes/${req.params.id}">Back</a></section>`));
+  }finally{client.release();}
+});
+
+app.get('/credit-notes/:id/pdf',async(req,res)=>{
+  try{
+    const data=await loadCreditNote(req.params.id);
+    if(!data)return res.status(404).send('Credit note not found.');
+    if(!data.note.locked_at)return res.status(400).send('Issue the credit note before downloading the PDF.');
+    const pdf=await buildCreditNotePdfBuffer(data);
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Credit-Note-${data.note.credit_note_number}.pdf"`);
+    res.send(pdf);
+  }catch(err){console.error(err);res.status(500).send(esc(err.message));}
+});
+
+app.post('/credit-notes/:id/email',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    const data=await loadCreditNote(req.params.id);
+    if(!data)throw new Error('Credit note not found.');
+    const {tenant,note:n}=data;
+    if(!n.locked_at)throw new Error('Issue the credit note before emailing it.');
+    if(!n.email)throw new Error('Customer does not have an email address.');
+    const transporter=getMailTransporter();
+    const pdf=await buildCreditNotePdfBuffer(data);
+    await transporter.sendMail({
+      from:process.env.SMTP_FROM||tenant.email||process.env.SMTP_USER,
+      to:n.email,
+      replyTo:tenant.email||undefined,
+      subject:`Sotoboats Credit Note ${n.credit_note_number}`,
+      html:`<div style="font-family:Arial,sans-serif;max-width:620px;margin:auto"><h2>Sotoboats Credit Note ${esc(n.credit_note_number)}</h2><p>Hello ${esc(n.contact_name||n.company_name||'Customer')},</p><p>Please find attached credit note <strong>${esc(n.credit_note_number)}</strong> relating to invoice <strong>${esc(n.original_invoice_number)}</strong>.</p><p><strong>Total credit: ${euro(n.total_minor)}</strong></p><p>Many thanks,<br>Sotoboats</p></div>`,
+      text:`Hello ${n.contact_name||n.company_name||'Customer'},\n\nPlease find attached credit note ${n.credit_note_number} relating to invoice ${n.original_invoice_number}.\nTotal credit: ${euro(n.total_minor)}\n\nMany thanks,\nSotoboats`,
+      attachments:[{filename:`Sotoboats-Credit-Note-${n.credit_note_number}.pdf`,content:pdf,contentType:'application/pdf'}]
+    });
+    await client.query('BEGIN');
+    await client.query(`UPDATE customer_credit_notes SET emailed_at=now(),emailed_to=$1,updated_at=now() WHERE id=$2`,[n.email,n.id]);
+    await client.query('COMMIT');
+    res.redirect(`/credit-notes/${n.id}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    res.status(400).send(shell('Credit note email error','credit-notes',`<section class="card"><h2>Could not send credit note</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/credit-notes/${req.params.id}">Back</a></section>`));
+  }finally{client.release();}
+});
+
 app.get('/settings',async(req,res)=>{
   const t=await getTenant();
   const content=`<section class="form-card"><h2>Company & invoice settings</h2><form method="post" action="/settings"><div class="form-grid"><label>Trading name<input name="trading_name" value="${esc(t.trading_name)}" required></label><label>Legal entity<input name="legal_name" value="${esc(t.legal_name)}" required></label><label>Company / VAT ID<input name="tax_id" value="${esc(t.tax_id||'')}"></label><label>Invoice contact email<input type="email" name="email" value="${esc(t.email||'')}"></label><label>Phone<input name="phone" value="${esc(t.phone||'')}"></label><label>Website<input name="website" value="${esc(t.website||'')}"></label><label>Address<input name="address_1" value="${esc(t.address_1||'')}"></label><label>Postcode<input name="postcode" value="${esc(t.postcode||'')}"></label><label>City<input name="city" value="${esc(t.city||'')}"></label><label>Region<input name="region" value="${esc(t.region||'')}"></label><label>Invoice prefix<input name="invoice_prefix" value="${esc(t.invoice_prefix||'')}" placeholder="Blank keeps 0001575 style"></label><label>Next invoice number<input type="number" min="1" name="next_invoice_number" value="${Number(t.next_invoice_number)}"></label><label>Payment terms days<input type="number" min="0" name="payment_terms_days" value="${Number(t.payment_terms_days)}"></label><label>Default language<select name="default_language"><option value="bilingual" ${t.default_language==='bilingual'?'selected':''}>Bilingual</option><option value="en" ${t.default_language==='en'?'selected':''}>English</option><option value="es" ${t.default_language==='es'?'selected':''}>Spanish</option></select></label><label>Deposit %<input type="number" step="0.01" min="0" max="100" name="deposit_percent" value="${Number(t.deposit_percent)}"></label><label>Deposit threshold days<input type="number" min="0" name="deposit_threshold_days" value="${Number(t.deposit_threshold_days)}"></label><label>Bank account name<input name="bank_account_name" value="${esc(t.bank_account_name||'')}"></label><label>Bank name<input name="bank_name" value="${esc(t.bank_name||'')}"></label><label>IBAN<input name="bank_iban" value="${esc(t.bank_iban||'')}"></label><label>BIC / SWIFT<input name="bank_bic" value="${esc(t.bank_bic||'')}"></label><label class="full">English footer<textarea name="english_footer">${esc(t.english_footer||'')}</textarea></label><label class="full">Spanish footer<textarea name="spanish_footer">${esc(t.spanish_footer||'')}</textarea></label></div><div class="notice" style="margin-top:12px">The next invoice number is seeded at <strong>0001575</strong> to follow the current invoice #0001574. Change this only if Dave confirms a different active series.</div><div class="actions" style="margin-top:14px"><button class="btn gold">Save settings</button></div></form></section>`;
@@ -1247,8 +1693,77 @@ async function initialiseDatabase() {
       ADD COLUMN IF NOT EXISTS snapshot_identity_type TEXT,
       ADD COLUMN IF NOT EXISTS snapshot_identity_number TEXT,
       ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS reminder_count INTEGER NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS reminder_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS credited_minor BIGINT NOT NULL DEFAULT 0;
   `);
+
+  await pool.query(`
+    ALTER TABLE invoice_tenants
+      ADD COLUMN IF NOT EXISTS credit_note_prefix TEXT NOT NULL DEFAULT 'CN-',
+      ADD COLUMN IF NOT EXISTS credit_note_padding INTEGER NOT NULL DEFAULT 6,
+      ADD COLUMN IF NOT EXISTS next_credit_note_number INTEGER NOT NULL DEFAULT 1;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_credit_notes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
+      original_invoice_id UUID NOT NULL REFERENCES customer_invoices(id),
+      customer_id UUID NOT NULL REFERENCES invoice_customers(id),
+      credit_note_number TEXT,
+      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','issued','cancelled')),
+      invoice_language TEXT NOT NULL DEFAULT 'bilingual' CHECK (invoice_language IN ('en','es','bilingual')),
+      issue_date DATE,
+      reason TEXT NOT NULL,
+      notes TEXT,
+      subtotal_minor BIGINT NOT NULL DEFAULT 0,
+      tax_minor BIGINT NOT NULL DEFAULT 0,
+      total_minor BIGINT NOT NULL DEFAULT 0,
+      issued_at TIMESTAMPTZ,
+      locked_at TIMESTAMPTZ,
+      emailed_at TIMESTAMPTZ,
+      emailed_to TEXT,
+      snapshot_contact_name TEXT,
+      snapshot_company_name TEXT,
+      snapshot_email TEXT,
+      snapshot_phone TEXT,
+      snapshot_billing_address_1 TEXT,
+      snapshot_billing_address_2 TEXT,
+      snapshot_billing_city TEXT,
+      snapshot_billing_region TEXT,
+      snapshot_billing_postcode TEXT,
+      snapshot_billing_country_code TEXT,
+      snapshot_tax_number TEXT,
+      snapshot_identity_type TEXT,
+      snapshot_identity_number TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_credit_note_number_unique
+      ON customer_credit_notes(tenant_id, credit_note_number) WHERE credit_note_number IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_customer_credit_notes_invoice
+      ON customer_credit_notes(original_invoice_id, status);
+
+    CREATE TABLE IF NOT EXISTS customer_credit_note_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      credit_note_id UUID NOT NULL REFERENCES customer_credit_notes(id) ON DELETE CASCADE,
+      original_item_id UUID REFERENCES customer_invoice_items(id),
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      description_en TEXT NOT NULL,
+      description_es TEXT,
+      detail_en TEXT,
+      detail_es TEXT,
+      quantity NUMERIC(12,3) NOT NULL DEFAULT 1,
+      unit_price_minor BIGINT NOT NULL DEFAULT 0,
+      tax_rate NUMERIC(7,4) NOT NULL DEFAULT 21.0000,
+      line_net_minor BIGINT NOT NULL DEFAULT 0,
+      line_tax_minor BIGINT NOT NULL DEFAULT 0,
+      line_total_minor BIGINT NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_credit_note_items_note
+      ON customer_credit_note_items(credit_note_id, sort_order);
+  `);
+
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
 
