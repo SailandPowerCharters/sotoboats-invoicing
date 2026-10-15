@@ -68,6 +68,29 @@ async function getTenant(client = pool) {
   return rows[0];
 }
 
+async function refreshOverdueStatuses(tenantId) {
+  await pool.query(`
+    UPDATE customer_invoices
+    SET status='overdue', updated_at=now()
+    WHERE tenant_id=$1
+      AND locked_at IS NOT NULL
+      AND outstanding_minor > 0
+      AND due_date IS NOT NULL
+      AND due_date < CURRENT_DATE
+      AND status NOT IN ('paid','cancelled','credited','overdue')
+  `,[tenantId]);
+
+  await pool.query(`
+    UPDATE customer_invoices
+    SET status=CASE WHEN paid_minor > 0 THEN 'part_paid' ELSE 'sent' END, updated_at=now()
+    WHERE tenant_id=$1
+      AND status='overdue'
+      AND outstanding_minor > 0
+      AND due_date IS NOT NULL
+      AND due_date >= CURRENT_DATE
+  `,[tenantId]);
+}
+
 function statusPill(status) {
   const s = String(status || '').toLowerCase();
   const cls = ['paid'].includes(s) ? 'green' : ['overdue','cancelled'].includes(s) ? 'red' : ['sent','part_paid'].includes(s) ? 'amber' : '';
@@ -483,9 +506,90 @@ app.post('/customers/import',async(req,res)=>{
 
 app.get('/invoices',async(req,res)=>{
   const tenant=await getTenant();
-  const rows=(await pool.query(`SELECT i.*,c.contact_name,c.company_name FROM customer_invoices i JOIN invoice_customers c ON c.id=i.customer_id WHERE i.tenant_id=$1 ORDER BY i.created_at DESC`,[tenant.id])).rows;
-  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Service</th><th>Total</th><th>Paid</th><th>Outstanding</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.issue_date||r.created_at)}</span></td><td>${esc(r.company_name||r.contact_name)}</td><td>${esc(r.service_title||'—')}</td><td>${euro(r.total_minor)}</td><td>${euro(r.paid_minor)}</td><td>${euro(r.outstanding_minor)}</td><td>${statusPill(r.status)}</td><td><a class="btn light" href="/invoices/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No invoices yet.</p>';
-  res.send(shell('Invoices','invoices',`<section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">All invoices</h2><a class="btn gold" href="/invoices/new">Create invoice</a></div>${table}</section>`,'Draft, issue, track and reconcile Sotoboats invoices.'));
+  await refreshOverdueStatuses(tenant.id);
+
+  const q=String(req.query.q||'').trim();
+  const filter=String(req.query.filter||'all');
+  const params=[tenant.id];
+  let where=`i.tenant_id=$1`;
+
+  if(q){
+    params.push(`%${q}%`);
+    const p=params.length;
+    where+=` AND (
+      COALESCE(i.invoice_number,'') ILIKE $${p}
+      OR COALESCE(c.contact_name,'') ILIKE $${p}
+      OR COALESCE(c.company_name,'') ILIKE $${p}
+      OR COALESCE(c.email,'') ILIKE $${p}
+    )`;
+  }
+
+  if(filter==='draft') where+=` AND i.locked_at IS NULL`;
+  if(filter==='due') where+=` AND i.locked_at IS NOT NULL AND i.outstanding_minor>0 AND (i.due_date IS NULL OR i.due_date>=CURRENT_DATE)`;
+  if(filter==='overdue') where+=` AND i.locked_at IS NOT NULL AND i.outstanding_minor>0 AND i.due_date<CURRENT_DATE`;
+  if(filter==='paid') where+=` AND i.status='paid'`;
+  if(filter==='part_paid') where+=` AND i.status='part_paid'`;
+
+  const rows=(await pool.query(`
+    SELECT i.*,c.contact_name,c.company_name,c.email
+    FROM customer_invoices i
+    JOIN invoice_customers c ON c.id=i.customer_id
+    WHERE ${where}
+    ORDER BY
+      CASE WHEN i.status='overdue' THEN 0 ELSE 1 END,
+      COALESCE(i.due_date,i.created_at::date) ASC,
+      i.created_at DESC
+  `,params)).rows;
+
+  const counts=(await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE locked_at IS NULL)::int AS drafts,
+      COUNT(*) FILTER (WHERE locked_at IS NOT NULL AND outstanding_minor>0 AND (due_date IS NULL OR due_date>=CURRENT_DATE))::int AS due,
+      COUNT(*) FILTER (WHERE locked_at IS NOT NULL AND outstanding_minor>0 AND due_date<CURRENT_DATE)::int AS overdue,
+      COUNT(*) FILTER (WHERE status='paid')::int AS paid
+    FROM customer_invoices WHERE tenant_id=$1
+  `,[tenant.id])).rows[0];
+
+  const filters=[
+    ['all','All',null],
+    ['draft','Draft',counts.drafts],
+    ['due','Due',counts.due],
+    ['overdue','Overdue',counts.overdue],
+    ['paid','Paid',counts.paid]
+  ].map(([key,label,count])=>`<a class="btn ${filter===key?'gold':'light'}" href="/invoices?filter=${key}${q?`&q=${encodeURIComponent(q)}`:''}">${label}${count!==null?` (${count})`:''}</a>`).join('');
+
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Due date</th><th>Total</th><th>Outstanding</th><th>Status</th><th>Reminder</th><th></th></tr></thead><tbody>${rows.map(r=>{
+    const canRemind=r.locked_at&&Number(r.outstanding_minor)>0&&r.email;
+    const reminder=r.reminder_sent_at?`<span class="muted">Last sent ${fmtDate(r.reminder_sent_at)}${Number(r.reminder_count)>1?` · ${r.reminder_count} times`:''}</span>`:'';
+    return `<tr>
+      <td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.issue_date||r.created_at)}</span></td>
+      <td><strong>${esc(r.company_name||r.contact_name)}</strong><br><span class="muted">${esc(r.email||'')}</span></td>
+      <td>${fmtDate(r.due_date)}</td>
+      <td>${euro(r.total_minor)}</td>
+      <td><strong>${euro(r.outstanding_minor)}</strong></td>
+      <td>${statusPill(r.status)}</td>
+      <td>${canRemind?`<form method="post" action="/invoices/${r.id}/remind" onsubmit="return confirm('Send a friendly payment reminder to ${esc(r.email)}?');"><button class="btn light" type="submit">Send reminder</button></form>${reminder}`:reminder||'—'}</td>
+      <td><a class="btn light" href="/invoices/${r.id}">Open</a></td>
+    </tr>`;
+  }).join('')}</tbody></table></div>`:'<p class="sub">No invoices match this search/filter.</p>';
+
+  const content=`<section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:14px">
+      <div><h2 style="margin:0">All invoices</h2><p class="sub" style="margin:4px 0 0">Search customers and keep on top of money due.</p></div>
+      <a class="btn gold" href="/invoices/new">Create invoice</a>
+    </div>
+    <form method="get" action="/invoices" class="actions" style="margin-bottom:12px;align-items:end">
+      <label style="min-width:300px;max-width:480px">Search by name, email or invoice number
+        <input name="q" value="${esc(q)}" placeholder="e.g. Rachel, gmail.com or 0001575">
+      </label>
+      <input type="hidden" name="filter" value="${esc(filter)}">
+      <button class="btn light">Search</button>
+      ${q?'<a class="btn light" href="/invoices">Clear</a>':''}
+    </form>
+    <div class="actions" style="margin-bottom:16px">${filters}</div>
+    ${table}
+  </section>`;
+  res.send(shell('Invoices','invoices',content,'Search, filter and chase outstanding Sotoboats invoices.'));
 });
 
 function lineRowsHtml(items=[]) {
@@ -723,7 +827,7 @@ function invoicePreview(data){
   const vatGroups={}; items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});
   const identity=i.identity_number?`<p>${esc(i.identity_type||'ID')}: ${esc(i.identity_number)}</p>`:'';
   const rows=items.map(x=>`<tr><td><strong>${showEn?esc(x.description_en):esc(x.description_es||x.description_en)}</strong>${showEn&&x.detail_en?`<br><span class="muted">${esc(x.detail_en)}</span>`:''}${showEs&&x.description_es?`<br><span class="muted">${esc(x.description_es)}</span>`:''}${showEs&&x.detail_es?`<br><span class="muted">${esc(x.detail_es)}</span>`:''}</td><td>${Number(x.quantity)}</td><td>${euro(x.unit_price_minor)}</td><td>${Number(x.tax_rate).toFixed(0)}%</td><td>${euro(x.line_total_minor)}</td></tr>`).join('');
-  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><h2>SOTOBOATS</h2><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div><div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
+  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div><div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
 }
 
 
@@ -780,6 +884,32 @@ function invoiceEmailHtml(data) {
   </body></html>`;
 }
 
+
+function paymentReminderHtml(data) {
+  const {tenant,invoice:i}=data;
+  const overdue=i.due_date && dateYmd(i.due_date) < new Date().toISOString().slice(0,10);
+  const name=esc(i.contact_name||i.company_name||'Customer');
+  return `<!doctype html><html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
+  <div style="max-width:650px;margin:0 auto;padding:28px 16px">
+    <div style="background:#0b1d2f;padding:22px;border-radius:14px 14px 0 0">
+      <div style="color:#caa86d;font-size:12px;letter-spacing:.16em;font-weight:700">SOTOBOATS</div>
+      <div style="color:#fff;font-size:22px;font-weight:700;margin-top:5px">A quick payment reminder</div>
+    </div>
+    <div style="background:#fff;padding:28px;border:1px solid #e1e7ea;border-top:0;border-radius:0 0 14px 14px">
+      <p style="margin-top:0">Hello ${name},</p>
+      <p>Just a friendly reminder that there is still a balance outstanding on Sotoboats invoice <strong>${esc(i.invoice_number||'')}</strong>.</p>
+      <div style="background:#f5f8fa;border-radius:10px;padding:18px;margin:20px 0">
+        <div style="font-size:12px;color:#72838d">Balance outstanding</div>
+        <div style="font-size:28px;font-weight:700;color:#0b1d2f;margin-top:3px">${euro(i.outstanding_minor)}</div>
+        <div style="font-size:12px;color:#72838d;margin-top:5px">${overdue?'Was due':'Due'} ${fmtDate(i.due_date)}</div>
+      </div>
+      <p>If payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.</p>
+      <p style="margin-bottom:0">Many thanks,<br><strong>Sotoboats</strong></p>
+    </div>
+    <div style="text-align:center;color:#8998a0;font-size:11px;padding:16px">${esc(tenant.legal_name)} · ${esc(tenant.email||'')}</div>
+  </div></body></html>`;
+}
+
 function buildInvoicePdfBuffer(data) {
   return new Promise((resolve, reject) => {
     try {
@@ -791,10 +921,15 @@ function buildInvoicePdfBuffer(data) {
       doc.on('error',reject);
 
       const navy='#0b1d2f', gold='#caa86d', muted='#667783';
-      doc.fillColor(navy).font('Helvetica-Bold').fontSize(25).text('SOTOBOATS',45,45);
+      const logoPath=path.join(__dirname,'public','sotoboats-logo.png');
+      if(fs.existsSync(logoPath)){
+        doc.image(logoPath,45,42,{width:215});
+      }else{
+        doc.fillColor(navy).font('Helvetica-Bold').fontSize(25).text('SOTOBOATS',45,45);
+      }
       doc.fillColor(muted).font('Helvetica').fontSize(8).text(
         `${tenant.legal_name}\n${tenant.address_1 || ''}\n${tenant.postcode || ''} ${tenant.city || ''}, ${tenant.region || ''}\n${tenant.country_name || ''}\n${tenant.email || ''} · ${tenant.phone || ''}\nCompany ID: ${tenant.tax_id || ''}`,
-        45,82,{width:250}
+        45,90,{width:250}
       );
       doc.fillColor(navy).font('Helvetica-Bold').fontSize(15).text(`Invoice / Factura ${i.invoice_number}`,330,48,{width:220,align:'right'});
       doc.fillColor(muted).font('Helvetica').fontSize(8).text(
@@ -892,7 +1027,8 @@ function buildInvoicePdfBuffer(data) {
 app.get('/invoices/:id',async(req,res)=>{
   const data=await loadInvoice(req.params.id); if(!data)return res.status(404).send('Invoice not found.'); const i=data.invoice;
   const emailBtn=i.locked_at&&i.email?`<form method="post" action="/invoices/${i.id}/email" onsubmit="return confirm('${i.emailed_at?'Resend':'Send'} invoice ${esc(i.invoice_number||'')} to ${esc(i.email)}?');"><button class="btn gold">${i.emailed_at?'Resend invoice':'Send invoice'}</button></form>`:'';
-  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
+  const reminderBtn=i.locked_at&&i.email&&Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/remind" onsubmit="return confirm('Send a friendly payment reminder to ${esc(i.email)}?');"><button class="btn light">Send reminder</button></form>`:'';
+  const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}${reminderBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
   const payment=i.locked_at&&Number(i.outstanding_minor)>0?`<section class="card no-print"><h2>Record payment</h2><form method="post" action="/invoices/${i.id}/payments"><div class="form-grid three"><label>Amount €<input type="number" step="0.01" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" name="amount" value="${major(i.amount_due_now_minor??i.outstanding_minor).toFixed(2)}" required></label><label>Method<select name="method"><option value="bank_transfer">Bank transfer</option><option value="cash">Cash</option><option value="card_external">Card - external</option><option value="other">Other</option></select></label><label>Reference<input name="reference"></label></div><div class="actions" style="margin-top:12px"><button class="btn gold">Record payment</button></div></form></section>`:'';
   const audit=data.events.length?`<section class="card no-print"><h2>Audit trail</h2><div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>Actor</th></tr></thead><tbody>${data.events.map(e=>`<tr><td>${fmtDate(e.created_at)}</td><td>${esc(e.event_type.replaceAll('_',' '))}</td><td>${esc(e.actor_name||'System')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
   res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${payment}${audit}`,i.locked_at?'Issued invoices are locked. Payments can still be recorded.':'This is a draft and can still be edited.'));
@@ -1024,6 +1160,56 @@ app.post('/invoices/:id/email',async(req,res)=>{
   }
 });
 
+
+app.post('/invoices/:id/remind',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    const data=await loadInvoice(req.params.id);
+    if(!data) throw new Error('Invoice not found.');
+    const {tenant,invoice:i}=data;
+    if(!i.locked_at) throw new Error('Draft invoices cannot be chased for payment.');
+    if(Number(i.outstanding_minor)<=0) throw new Error('This invoice has no outstanding balance.');
+    if(!i.email) throw new Error('This customer does not have an email address.');
+
+    const transporter=getMailTransporter();
+    const pdf=await buildInvoicePdfBuffer(data);
+    const from=process.env.SMTP_FROM||tenant.email||process.env.SMTP_USER;
+
+    await transporter.sendMail({
+      from,
+      to:i.email,
+      replyTo:tenant.email||undefined,
+      subject:`Friendly payment reminder – Sotoboats Invoice ${i.invoice_number}`,
+      html:paymentReminderHtml(data),
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nJust a friendly reminder that ${euro(i.outstanding_minor)} remains outstanding on Sotoboats invoice ${i.invoice_number}, due ${fmtDate(i.due_date)}.\n\nIf payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.\n\nMany thanks,\nSotoboats`,
+      attachments:[{
+        filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
+        content:pdf,
+        contentType:'application/pdf'
+      }]
+    });
+
+    await client.query('BEGIN');
+    await client.query(`
+      UPDATE customer_invoices
+      SET reminder_sent_at=now(), reminder_count=COALESCE(reminder_count,0)+1, updated_at=now()
+      WHERE id=$1 AND tenant_id=$2
+    `,[i.id,tenant.id]);
+    await client.query(`
+      INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+      VALUES($1,$2,'payment_reminder_sent','Sotoboats Admin',jsonb_build_object('to',to_jsonb($3::text),'outstanding_minor',to_jsonb($4::bigint)))
+    `,[tenant.id,i.id,i.email,Number(i.outstanding_minor)]);
+    await client.query('COMMIT');
+    res.redirect(`/invoices?filter=${i.status==='overdue'?'overdue':'due'}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    console.error(err);
+    res.status(400).send(shell('Reminder error','invoices',`<section class="card"><h2>Could not send reminder</h2><p class="sub">${esc(err.message)}</p><div class="actions"><a class="btn light" href="/invoices">Back to invoices</a></div></section>`));
+  }finally{
+    client.release();
+  }
+});
+
 app.get('/settings',async(req,res)=>{
   const t=await getTenant();
   const content=`<section class="form-card"><h2>Company & invoice settings</h2><form method="post" action="/settings"><div class="form-grid"><label>Trading name<input name="trading_name" value="${esc(t.trading_name)}" required></label><label>Legal entity<input name="legal_name" value="${esc(t.legal_name)}" required></label><label>Company / VAT ID<input name="tax_id" value="${esc(t.tax_id||'')}"></label><label>Invoice contact email<input type="email" name="email" value="${esc(t.email||'')}"></label><label>Phone<input name="phone" value="${esc(t.phone||'')}"></label><label>Website<input name="website" value="${esc(t.website||'')}"></label><label>Address<input name="address_1" value="${esc(t.address_1||'')}"></label><label>Postcode<input name="postcode" value="${esc(t.postcode||'')}"></label><label>City<input name="city" value="${esc(t.city||'')}"></label><label>Region<input name="region" value="${esc(t.region||'')}"></label><label>Invoice prefix<input name="invoice_prefix" value="${esc(t.invoice_prefix||'')}" placeholder="Blank keeps 0001575 style"></label><label>Next invoice number<input type="number" min="1" name="next_invoice_number" value="${Number(t.next_invoice_number)}"></label><label>Payment terms days<input type="number" min="0" name="payment_terms_days" value="${Number(t.payment_terms_days)}"></label><label>Default language<select name="default_language"><option value="bilingual" ${t.default_language==='bilingual'?'selected':''}>Bilingual</option><option value="en" ${t.default_language==='en'?'selected':''}>English</option><option value="es" ${t.default_language==='es'?'selected':''}>Spanish</option></select></label><label>Deposit %<input type="number" step="0.01" min="0" max="100" name="deposit_percent" value="${Number(t.deposit_percent)}"></label><label>Deposit threshold days<input type="number" min="0" name="deposit_threshold_days" value="${Number(t.deposit_threshold_days)}"></label><label>Bank account name<input name="bank_account_name" value="${esc(t.bank_account_name||'')}"></label><label>Bank name<input name="bank_name" value="${esc(t.bank_name||'')}"></label><label>IBAN<input name="bank_iban" value="${esc(t.bank_iban||'')}"></label><label>BIC / SWIFT<input name="bank_bic" value="${esc(t.bank_bic||'')}"></label><label class="full">English footer<textarea name="english_footer">${esc(t.english_footer||'')}</textarea></label><label class="full">Spanish footer<textarea name="spanish_footer">${esc(t.spanish_footer||'')}</textarea></label></div><div class="notice" style="margin-top:12px">The next invoice number is seeded at <strong>0001575</strong> to follow the current invoice #0001574. Change this only if Dave confirms a different active series.</div><div class="actions" style="margin-top:14px"><button class="btn gold">Save settings</button></div></form></section>`;
@@ -1059,7 +1245,9 @@ async function initialiseDatabase() {
       ADD COLUMN IF NOT EXISTS snapshot_billing_country_code TEXT,
       ADD COLUMN IF NOT EXISTS snapshot_tax_number TEXT,
       ADD COLUMN IF NOT EXISTS snapshot_identity_type TEXT,
-      ADD COLUMN IF NOT EXISTS snapshot_identity_number TEXT;
+      ADD COLUMN IF NOT EXISTS snapshot_identity_number TEXT,
+      ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS reminder_count INTEGER NOT NULL DEFAULT 0;
   `);
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
