@@ -5,12 +5,24 @@ const pgSession = require('connect-pg-simple')(session);
 const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
 const archiver = require('archiver');
+const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const EXPENSE_UPLOAD_DIR = path.join(__dirname, 'uploads', 'expenses');
+fs.mkdirSync(EXPENSE_UPLOAD_DIR, { recursive: true });
+const expenseUpload = multer({
+  dest: EXPENSE_UPLOAD_DIR,
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['application/pdf','image/jpeg','image/png','image/webp'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PDF, JPG, PNG and WEBP expense files are supported.'));
+  }
+});
 
 app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -341,6 +353,33 @@ function monthEndCreditsCsv(rows, month) {
   return [header,...data].map(row=>row.map(csvEscape).join(',')).join('\n');
 }
 
+
+function safeUploadName(name='expense') {
+  return String(name||'expense').replace(/[^a-zA-Z0-9._-]/g,'_');
+}
+
+async function monthEndExpenseRows(tenantId, month) {
+  const b=monthBounds(month);
+  if(!b) return [];
+  return (await pool.query(`
+    SELECT * FROM expense_records
+    WHERE tenant_id=$1
+      AND expense_date >= $2::date
+      AND expense_date < $3::date
+    ORDER BY expense_date, supplier_name, created_at
+  `,[tenantId,b.start,b.end])).rows;
+}
+
+function monthEndExpensesCsv(rows, month) {
+  const header=['Month','Expense Date','Supplier','Supplier Tax ID','Document Number','Category','Description','Net','VAT','Gross','VAT Rate','Payment Method','Source File','Notes'];
+  const data=rows.map(r=>[
+    monthLabel(month),fmtDate(r.expense_date),r.supplier_name||'',r.supplier_tax_id||'',r.document_number||'',r.category||'',
+    r.description||'',major(r.net_minor).toFixed(2),major(r.tax_minor).toFixed(2),major(r.total_minor).toFixed(2),
+    r.tax_rate==null?'':Number(r.tax_rate).toFixed(2),r.payment_method||'',r.source_file_name||'',r.notes||''
+  ]);
+  return [header,...data].map(row=>row.map(csvEscape).join(',')).join('\\n');
+}
+
 const nav = (active) => `
   <aside class="side">
     <div class="brand"><span class="mark">S</span><div><strong>SOTOBOATS</strong><small>INVOICING · YDP PILOT</small></div></div>
@@ -348,7 +387,8 @@ const nav = (active) => `
       <a class="${active==='dashboard'?'active':''}" href="/">Dashboard</a>
       <a class="${active==='invoices'?'active':''}" href="/invoices">Invoices</a>
       <a class="${active==='credit-notes'?'active':''}" href="/credit-notes">Credit Notes</a>
-      <a class="${active==='month-end'?'active':''}" href="/month-end">Month End</a>
+      <a class="${active==='expenses'?'active':''}" href="/expenses">Expenses</a>
+      <a class="${active==='month-end'?'active':''}" href="/month-end">Gestor</a>
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
@@ -694,6 +734,66 @@ app.post('/customers/import',async(req,res)=>{
     }
   }
   res.json({ok:true,imported,updated,skipped,errors});
+});
+
+
+app.get('/expenses',async(req,res)=>{
+  const tenant=await getTenant();
+  const q=String(req.query.q||'').trim();
+  const params=[tenant.id];
+  let where='tenant_id=$1';
+  if(q){
+    params.push(`%${q}%`);
+    const p=params.length;
+    where+=` AND (COALESCE(supplier_name,'') ILIKE $${p} OR COALESCE(document_number,'') ILIKE $${p} OR COALESCE(category,'') ILIKE $${p} OR COALESCE(description,'') ILIKE $${p})`;
+  }
+  const rows=(await pool.query(`SELECT * FROM expense_records WHERE ${where} ORDER BY COALESCE(expense_date,created_at::date) DESC,created_at DESC`,params)).rows;
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th>File</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td>${fmtDate(r.expense_date)}</td><td><strong>${esc(r.supplier_name||'—')}</strong></td><td>${esc(r.document_number||'—')}</td><td>${esc(r.category||'—')}</td><td>${euro(r.net_minor)}</td><td>${euro(r.tax_minor)}</td><td><strong>${euro(r.total_minor)}</strong></td><td>${r.source_file_name?`<a class="btn light" href="/expenses/${r.id}/file" target="_blank">Open file</a>`:'—'}</td><td><a class="btn light" href="/expenses/${r.id}/edit">Edit</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured yet.</p>';
+  const content=`<section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:14px"><div><h2 style="margin:0">Expenses</h2><p class="sub" style="margin:4px 0 0">Capture supplier invoices and receipts for the Gestor pack.</p></div><a class="btn gold" href="/expenses/new">Add expense</a></div><form method="get" action="/expenses" class="actions" style="margin-bottom:14px;align-items:end"><label style="min-width:300px">Search expenses<input name="q" value="${esc(q)}" placeholder="Supplier, document number, category"></label><button class="btn light">Search</button>${q?'<a class="btn light" href="/expenses">Clear</a>':''}</form>${table}</section><section class="card"><h2>Google Drive intake</h2><p class="sub">Next step: connect a shared Google Drive folder so new scans automatically appear here. For now, uploads can be added directly.</p></section>`;
+  res.send(shell('Expenses','expenses',content,'Supplier bills, receipts and supporting documents.'));
+});
+
+function expenseForm(e={},action='/expenses/new',heading='Add expense'){
+  return `<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${esc(heading)}</h2><p class="sub">No approval step — capture it, correct it if needed, and it flows into the Gestor pack.</p></div><a class="btn light" href="/expenses">Back to expenses</a></div><form method="post" action="${action}" enctype="multipart/form-data" id="expenseForm"><div class="form-grid three"><label>Expense date<input type="date" name="expense_date" value="${iso(e.expense_date)}"></label><label>Supplier<input name="supplier_name" value="${esc(e.supplier_name||'')}" required></label><label>Supplier Tax ID<input name="supplier_tax_id" value="${esc(e.supplier_tax_id||'')}"></label><label>Invoice / receipt number<input name="document_number" value="${esc(e.document_number||'')}"></label><label>Category<select name="category">${['Fuel','Marina / Berthing','Maintenance / Repairs','Boat Supplies','Training / Courses','Travel / Subsistence','Cleaning','Office / Admin','Marketing','Insurance','Professional Fees','Other'].map(x=>`<option value="${x}" ${e.category===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Payment method<select name="payment_method">${['Bank transfer','Card','Cash','Direct debit','Other'].map(x=>`<option value="${x}" ${e.payment_method===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Net €<input id="expenseNet" type="number" step="0.01" min="0" name="net_amount" value="${major(e.net_minor||0).toFixed(2)}"></label><label>VAT rate %<input id="expenseVatRate" type="number" step="0.01" min="0" name="tax_rate" value="${e.tax_rate==null?'21':Number(e.tax_rate)}"></label><label>VAT €<input id="expenseVat" type="number" step="0.01" min="0" name="tax_amount" value="${major(e.tax_minor||0).toFixed(2)}"></label><label>Gross total €<input id="expenseTotal" type="number" step="0.01" min="0" name="total_amount" value="${major(e.total_minor||0).toFixed(2)}" required></label><label class="full">Description<input name="description" value="${esc(e.description||'')}"></label><label class="full">Notes<textarea name="notes">${esc(e.notes||'')}</textarea></label><label class="full">Receipt / supplier invoice<input type="file" name="expense_file" accept=".pdf,image/jpeg,image/png,image/webp"></label></div>${e.source_file_name?`<p class="sub">Current file: ${esc(e.source_file_name)} · upload a new file only to replace it.</p>`:''}<div class="actions"><button class="btn gold">Save expense</button></div></form></section><script>(function(){const net=document.getElementById('expenseNet'),rate=document.getElementById('expenseVatRate'),vat=document.getElementById('expenseVat'),total=document.getElementById('expenseTotal');function calc(){const n=parseFloat(net.value)||0,r=parseFloat(rate.value)||0,v=n*r/100;vat.value=v.toFixed(2);total.value=(n+v).toFixed(2);}net.addEventListener('input',calc);rate.addEventListener('input',calc);})();</script>`;
+}
+
+app.get('/expenses/new',(req,res)=>res.send(shell('Add Expense','expenses',expenseForm(),'Capture a receipt or supplier invoice.')));
+
+app.post('/expenses/new',expenseUpload.single('expense_file'),async(req,res)=>{
+  try{
+    const tenant=await getTenant(); const b=req.body; const file=req.file||null;
+    await pool.query(`INSERT INTO expense_records(tenant_id,supplier_name,supplier_tax_id,document_number,expense_date,category,description,net_minor,tax_minor,total_minor,tax_rate,payment_method,notes,source_type,source_file_name,source_file_path,extraction_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'manual',$14,$15,'manual')`,
+      [tenant.id,b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,file?file.originalname:null,file?file.path:null]);
+    res.redirect('/expenses');
+  }catch(err){
+    if(req.file){try{fs.unlinkSync(req.file.path);}catch(_){}}
+    res.status(400).send(shell('Expense error','expenses',`<section class="card"><h2>Could not save expense</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/expenses/new">Back</a></section>`));
+  }
+});
+
+app.get('/expenses/:id/edit',async(req,res)=>{
+  const tenant=await getTenant();
+  const e=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!e)return res.status(404).send('Expense not found.');
+  res.send(shell('Edit Expense','expenses',expenseForm(e,`/expenses/${e.id}/edit`,'Edit expense'),'Correct or complete the captured details.'));
+});
+
+app.post('/expenses/:id/edit',expenseUpload.single('expense_file'),async(req,res)=>{
+  const tenant=await getTenant();
+  const current=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!current)return res.status(404).send('Expense not found.');
+  const b=req.body; let fileName=current.source_file_name,filePath=current.source_file_path;
+  if(req.file){if(filePath){try{fs.unlinkSync(filePath);}catch(_){}} fileName=req.file.originalname;filePath=req.file.path;}
+  await pool.query(`UPDATE expense_records SET supplier_name=$1,supplier_tax_id=$2,document_number=$3,expense_date=$4,category=$5,description=$6,net_minor=$7,tax_minor=$8,total_minor=$9,tax_rate=$10,payment_method=$11,notes=$12,source_file_name=$13,source_file_path=$14,updated_at=now() WHERE id=$15 AND tenant_id=$16`,
+    [b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,fileName,filePath,req.params.id,tenant.id]);
+  res.redirect('/expenses');
+});
+
+app.get('/expenses/:id/file',async(req,res)=>{
+  const tenant=await getTenant();
+  const e=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!e||!e.source_file_path||!fs.existsSync(e.source_file_path))return res.status(404).send('Expense file not found.');
+  res.download(e.source_file_path,e.source_file_name||'expense-document');
 });
 
 app.get('/invoices',async(req,res)=>{
@@ -1807,10 +1907,13 @@ app.get('/month-end',async(req,res)=>{
   const month=normaliseMonth(req.query.month)||defaultMonth;
   const income=await monthEndIncomeRows(tenant.id,month);
   const credits=await monthEndCreditRows(tenant.id,month);
+  const expenses=await monthEndExpenseRows(tenant.id,month);
 
   const received=income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0);
   const invoiceCount=income.length;
   const creditTotal=credits.reduce((s,r)=>s+Number(r.total_minor||0),0);
+  const expenseTotal=expenses.reduce((s,r)=>s+Number(r.total_minor||0),0);
+  const expenseVat=expenses.reduce((s,r)=>s+Number(r.tax_minor||0),0);
 
   const incomeTable=income.length?`<div class="table-wrap"><table>
     <thead><tr><th>Invoice</th><th>Customer</th><th>Payment date(s)</th><th>Invoice total</th><th>Received this month</th><th>Method</th><th>Outstanding</th><th></th></tr></thead>
@@ -1837,9 +1940,12 @@ app.get('/month-end',async(req,res)=>{
       <td><a class="btn light" href="/credit-notes/${r.credit_note_id}">Open</a></td>
     </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No credit notes were issued in this month.</p>';
 
+
+  const expenseTable=expenses.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th></th></tr></thead><tbody>${expenses.map(r=>`<tr><td>${fmtDate(r.expense_date)}</td><td>${esc(r.supplier_name||'—')}</td><td>${esc(r.document_number||'—')}</td><td>${esc(r.category||'—')}</td><td>${euro(r.net_minor)}</td><td>${euro(r.tax_minor)}</td><td><strong>${euro(r.total_minor)}</strong></td><td><a class="btn light" href="/expenses/${r.id}/edit">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured in this month.</p>';
+
   const content=`<section class="card">
     <div class="actions" style="justify-content:space-between;align-items:end">
-      <div><h2 style="margin:0">Accountant / Month End</h2><p class="sub" style="margin:5px 0 0">Income is grouped by the date payment was actually received.</p></div>
+      <div><h2 style="margin:0">Gestor / Month End</h2><p class="sub" style="margin:5px 0 0">Income is grouped by the date payment was actually received.</p></div>
       <form method="get" action="/month-end" class="actions" style="align-items:end">
         <label>Month<input type="month" name="month" value="${esc(month)}"></label>
         <button class="btn gold">Load month</button>
@@ -1852,6 +1958,8 @@ app.get('/month-end',async(req,res)=>{
     <div class="metric"><small>Invoices paid into</small><strong>${invoiceCount}</strong></div>
     <div class="metric"><small>Credit notes issued</small><strong>${credits.length}</strong></div>
     <div class="metric"><small>Credit total</small><strong>${euro(creditTotal)}</strong></div>
+    <div class="metric"><small>Expenses</small><strong>${euro(expenseTotal)}</strong></div>
+    <div class="metric"><small>Expense VAT</small><strong>${euro(expenseVat)}</strong></div>
   </div>
 
   <section class="card">
@@ -1859,7 +1967,7 @@ app.get('/month-end',async(req,res)=>{
       <div><h2 style="margin:0">Payments received — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Partial payments count only the amount received during this month.</p></div>
       <div class="actions">
         <a class="btn light" href="/month-end/income.csv?month=${encodeURIComponent(month)}">Download CSV</a>
-        <a class="btn gold" href="/month-end/accountant-pack.zip?month=${encodeURIComponent(month)}">Download accountant pack</a>
+        <a class="btn gold" href="/month-end/gestor-pack.zip?month=${encodeURIComponent(month)}">Download Gestor pack</a>
       </div>
     </div>
     ${incomeTable}
@@ -1867,18 +1975,21 @@ app.get('/month-end',async(req,res)=>{
 
   <section class="card">
     <div class="actions" style="justify-content:space-between;margin-bottom:12px">
-      <div><h2 style="margin:0">Credit notes issued — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Included separately so the accountant can see corrections against original invoices.</p></div>
+      <div><h2 style="margin:0">Credit notes issued — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Included separately so the Gestor can see corrections against original invoices.</p></div>
       ${credits.length?`<a class="btn light" href="/month-end/credit-notes.csv?month=${encodeURIComponent(month)}">Download credit-note CSV</a>`:''}
     </div>
     ${creditTable}
   </section>
 
   <section class="card">
-    <h2>Expenses</h2>
-    <p class="sub">The expense-scanning inbox will sit here next: upload receipts/invoices → extract supplier/date/net/VAT/gross → review → include in the same accountant pack.</p>
+    <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div><h2 style="margin:0">Expenses — ${esc(monthLabel(month))}</h2><p class="sub" style="margin:4px 0 0">Captured supplier invoices and receipts for this month.</p></div>
+      <div class="actions"><a class="btn light" href="/month-end/expenses.csv?month=${encodeURIComponent(month)}">Download expense CSV</a><a class="btn light" href="/expenses/new">Add expense</a></div>
+    </div>
+    ${expenseTable}
   </section>`;
 
-  res.send(shell(`Month End – ${monthLabel(month)}`,'month-end',content,'Monthly accountant pack based on real receipts of payment.'));
+  res.send(shell(`Gestor – ${monthLabel(month)}`,'month-end',content,'Monthly Gestor pack based on real receipts of payment.'));
 });
 
 app.get('/month-end/income.csv',async(req,res)=>{
@@ -1903,7 +2014,19 @@ app.get('/month-end/credit-notes.csv',async(req,res)=>{
   res.send('\uFEFF'+csv);
 });
 
-app.get('/month-end/accountant-pack.zip',async(req,res)=>{
+
+app.get('/month-end/expenses.csv',async(req,res)=>{
+  const tenant=await getTenant();
+  const month=normaliseMonth(req.query.month);
+  if(!month)return res.status(400).send('Choose a valid month.');
+  const rows=await monthEndExpenseRows(tenant.id,month);
+  const csv=monthEndExpensesCsv(rows,month);
+  res.type('text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Expenses-${month}.csv"`);
+  res.send('\uFEFF'+csv);
+});
+
+app.get('/month-end/gestor-pack.zip',async(req,res)=>{
   try{
     const tenant=await getTenant();
     const month=normaliseMonth(req.query.month);
@@ -1911,9 +2034,10 @@ app.get('/month-end/accountant-pack.zip',async(req,res)=>{
 
     const income=await monthEndIncomeRows(tenant.id,month);
     const credits=await monthEndCreditRows(tenant.id,month);
+    const expenses=await monthEndExpenseRows(tenant.id,month);
 
     res.setHeader('Content-Type','application/zip');
-    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Accountant-Pack-${month}.zip"`);
+    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Gestor-Pack-${month}.zip"`);
 
     const archive=archiver('zip',{zlib:{level:9}});
     archive.on('error',err=>{throw err;});
@@ -1921,19 +2045,24 @@ app.get('/month-end/accountant-pack.zip',async(req,res)=>{
 
     archive.append('\uFEFF'+monthEndIncomeCsv(income,month),{name:`Sotoboats-Income-${month}.csv`});
     if(credits.length)archive.append('\uFEFF'+monthEndCreditsCsv(credits,month),{name:`Sotoboats-Credit-Notes-${month}.csv`});
+    if(expenses.length)archive.append('\uFEFF'+monthEndExpensesCsv(expenses,month),{name:`Sotoboats-Expenses-${month}.csv`});
 
     const summaryLines=[
-      `Sotoboats Accountant Pack – ${monthLabel(month)}`,
+      `Sotoboats Gestor Pack – ${monthLabel(month)}`,
       '',
       `Payments received: ${euro(income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0))}`,
       `Invoices with payments: ${income.length}`,
       `Credit notes issued: ${credits.length}`,
       `Credit-note total: ${euro(credits.reduce((s,r)=>s+Number(r.total_minor||0),0))}`,
+      `Expenses captured: ${expenses.length}`,
+      `Expense total: ${euro(expenses.reduce((s,r)=>s+Number(r.total_minor||0),0))}`,
+      `Expense VAT: ${euro(expenses.reduce((s,r)=>s+Number(r.tax_minor||0),0))}`,
       '',
       'Income selection basis: payment received date.',
       'Partial payments are included only for the amount received during the selected month.',
       'Invoice PDFs are included once per invoice that received at least one payment in the selected month.',
-      'Credit-note PDFs are included for credit notes issued in the selected month.'
+      'Credit-note PDFs are included for credit notes issued in the selected month.',
+      'Expense documents are included for expenses dated in the selected month.'
     ];
     archive.append(summaryLines.join('\n'),{name:`README-${month}.txt`});
 
@@ -1953,6 +2082,15 @@ app.get('/month-end/accountant-pack.zip',async(req,res)=>{
       archive.append(pdf,{name:`Credit Notes/Sotoboats-Credit-Note-${safeNo}.pdf`});
     }
 
+
+    for(const e of expenses){
+      if(!e.source_file_path||!fs.existsSync(e.source_file_path))continue;
+      const safeSupplier=safeUploadName(e.supplier_name||'Expense');
+      const safeFile=safeUploadName(e.source_file_name||path.basename(e.source_file_path));
+      const safeDate=fmtDate(e.expense_date).replace(/\//g,'-');
+      archive.file(e.source_file_path,{name:`Expenses/${safeDate}-${safeSupplier}-${safeFile}`});
+    }
+
     await archive.finalize();
   }catch(err){
     console.error(err);
@@ -1960,6 +2098,12 @@ app.get('/month-end/accountant-pack.zip',async(req,res)=>{
     else res.end();
   }
 });
+
+app.get('/month-end/accountant-pack.zip',(req,res)=>{
+  const qs=req.url.includes('?')?req.url.slice(req.url.indexOf('?')):'';
+  res.redirect('/month-end/gestor-pack.zip'+qs);
+});
+
 
 app.get('/settings',async(req,res)=>{
   const t=await getTenant();
@@ -2069,6 +2213,33 @@ async function initialiseDatabase() {
       ON customer_credit_note_items(credit_note_id, sort_order);
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS expense_records (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
+      supplier_name TEXT,
+      supplier_tax_id TEXT,
+      document_number TEXT,
+      expense_date DATE,
+      category TEXT,
+      description TEXT,
+      net_minor BIGINT NOT NULL DEFAULT 0,
+      tax_minor BIGINT NOT NULL DEFAULT 0,
+      total_minor BIGINT NOT NULL DEFAULT 0,
+      tax_rate NUMERIC(7,4),
+      payment_method TEXT,
+      notes TEXT,
+      source_type TEXT NOT NULL DEFAULT 'manual',
+      source_file_name TEXT,
+      source_file_path TEXT,
+      source_drive_url TEXT,
+      extraction_status TEXT NOT NULL DEFAULT 'manual',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_expense_records_tenant_date
+      ON expense_records(tenant_id, expense_date);
+  `);
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
 
