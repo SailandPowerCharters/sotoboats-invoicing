@@ -470,6 +470,11 @@ function requireAuth(req, res, next) {
   res.redirect('/login');
 }
 
+function requireGestorAuth(req,res,next){
+  if(req.session?.sotoboatsGestorAuthed) return next();
+  res.redirect('/gestor-login');
+}
+
 async function recalcInvoice(client, invoiceId) {
   const items = (await client.query(`SELECT * FROM customer_invoice_items WHERE invoice_id=$1 ORDER BY sort_order`, [invoiceId])).rows;
   const subtotal = items.reduce((s,i)=>s+Number(i.line_net_minor),0);
@@ -800,6 +805,199 @@ app.post('/login',(req,res)=>{
   res.redirect('/login?error=1');
 });
 app.get('/logout',(req,res)=>req.session.destroy(()=>res.redirect('/login')));
+
+app.get('/gestor-login',(req,res)=>{
+  if(req.session?.sotoboatsGestorAuthed) return res.redirect('/gestor-portal');
+  const configured=!!(String(process.env.GESTOR_EMAIL||'').trim() && String(process.env.GESTOR_PASSWORD||'').trim());
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Login</title><link rel="stylesheet" href="/styles.css"></head><body class="login-page"><form class="login-card" method="post" action="/gestor-login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Gestor Portal</h1><p class="sub">Marbella Sailing School S.L. · Read-only finance access</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}${!configured?'<div class="error">Gestor login is not configured yet. Add GESTOR_EMAIL and GESTOR_PASSWORD in Render.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter Gestor Portal →</button><p class="sub" style="margin-top:14px"><a href="/login">Sotoboats admin login</a></p></form></body></html>`);
+});
+
+app.post('/gestor-login',(req,res)=>{
+  const email=String(process.env.GESTOR_EMAIL||'').trim();
+  const password=String(process.env.GESTOR_PASSWORD||'');
+  if(email && password && String(req.body.email||'').trim().toLowerCase()===email.toLowerCase() && String(req.body.password||'')===password){
+    req.session.sotoboatsGestorAuthed=true;
+    return req.session.save(()=>res.redirect('/gestor-portal'));
+  }
+  res.redirect('/gestor-login?error=1');
+});
+
+app.get('/gestor-logout',(req,res)=>{
+  delete req.session.sotoboatsGestorAuthed;
+  req.session.save(()=>res.redirect('/gestor-login'));
+});
+
+app.get('/gestor-portal',requireGestorAuth,async(req,res)=>{
+  const tenant=await getTenant();
+  const today=new Date();
+  const defaultMonth=`${today.getUTCFullYear()}-${String(today.getUTCMonth()+1).padStart(2,'0')}`;
+  const month=normaliseMonth(req.query.month)||defaultMonth;
+  const income=await monthEndIncomeRows(tenant.id,month);
+  const credits=await monthEndCreditRows(tenant.id,month);
+  const expenses=await monthEndExpenseRows(tenant.id,month);
+
+  const received=income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0);
+  const creditTotal=credits.reduce((s,r)=>s+Number(r.total_minor||0),0);
+  const expenseNet=expenses.reduce((s,r)=>s+Number(r.net_minor||0),0);
+  const expenseVat=expenses.reduce((s,r)=>s+Number(r.tax_minor||0),0);
+  const expenseTotal=expenses.reduce((s,r)=>s+Number(r.total_minor||0),0);
+
+  const incomeTable=income.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Payment date</th><th>Invoice total</th><th>Received this month</th><th>Outstanding</th><th></th></tr></thead><tbody>${income.map(r=>`<tr><td><strong>${esc(r.invoice_number||'')}</strong></td><td>${esc(r.company_name||r.contact_name||'')}</td><td>${fmtDate(r.first_payment_in_month)}${String(r.first_payment_in_month)!==String(r.last_payment_in_month)?` – ${fmtDate(r.last_payment_in_month)}`:''}</td><td>${euro(r.total_minor)}</td><td><strong>${euro(r.received_in_month_minor)}</strong></td><td>${euro(r.outstanding_minor)}</td><td><a class="btn light" target="_blank" href="/gestor/invoices/${r.invoice_id}/pdf">PDF</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No payments received in this month.</p>';
+
+  const creditTable=credits.length?`<div class="table-wrap"><table><thead><tr><th>Credit note</th><th>Original invoice</th><th>Customer</th><th>Date</th><th>Total</th><th></th></tr></thead><tbody>${credits.map(r=>`<tr><td><strong>${esc(r.credit_note_number||'')}</strong></td><td>${esc(r.original_invoice_number||'')}</td><td>${esc(r.company_name||r.contact_name||'')}</td><td>${fmtDate(r.issue_date)}</td><td>${euro(r.total_minor)}</td><td><a class="btn light" target="_blank" href="/gestor/credit-notes/${r.credit_note_id}/pdf">PDF</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No credit notes issued in this month.</p>';
+
+  const expenseTable=expenses.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th></th></tr></thead><tbody>${expenses.map(e=>`<tr><td>${fmtDate(e.expense_date)}</td><td>${esc(e.supplier_name||'—')}</td><td>${esc(e.document_number||e.source_file_name||'—')}</td><td>${esc(e.category||'—')}</td><td>${euro(e.net_minor)}</td><td>${euro(e.tax_minor)}</td><td><strong>${euro(e.total_minor)}</strong></td><td>${(e.source_drive_url||e.source_file_path)?`<a class="btn light" target="_blank" href="/gestor/expenses/${e.id}/file">Document</a>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured in this month.</p>';
+
+  const page=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Portal</title><link rel="stylesheet" href="/styles.css"><style>
+    body{background:#f4f7f9;color:#0b1d2f}.gestor-wrap{max-width:1500px;margin:0 auto;padding:28px}.gestor-head{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:20px}.gestor-brand{display:flex;align-items:center;gap:14px}.gestor-mark{width:42px;height:42px;border-radius:50%;border:1px solid #caa86d;display:grid;place-items:center;color:#caa86d;font-family:Georgia,serif;font-size:22px}.gestor-title h1{margin:0;font-family:Georgia,serif;font-size:34px}.gestor-title p{margin:3px 0 0;color:#667783}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:18px 0}.metric{background:white;border:1px solid #dce3e6;border-radius:12px;padding:16px}.metric small{display:block;color:#667783;margin-bottom:6px}.metric strong{font-size:22px}.card{background:#fff;border:1px solid #dce3e6;border-radius:14px;padding:18px;margin-bottom:16px}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.btn{display:inline-block;border:1px solid #d5dde2;border-radius:9px;padding:10px 14px;background:white;color:#0b1d2f;text-decoration:none;font-weight:700;font-size:13px;cursor:pointer}.btn.gold{background:#caa86d;border-color:#caa86d}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1px solid #e4e9ec;text-align:left;font-size:13px}th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#667783}.sub{color:#667783}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.section-head h2{margin:0;font-family:Georgia,serif}@media(max-width:900px){.metrics{grid-template-columns:1fr 1fr}.gestor-head{align-items:flex-start;flex-direction:column}}@media(max-width:600px){.gestor-wrap{padding:15px}.metrics{grid-template-columns:1fr}.gestor-title h1{font-size:28px}}
+  </style></head><body><div class="gestor-wrap">
+    <header class="gestor-head"><div class="gestor-brand"><div class="gestor-mark">S</div><div class="gestor-title"><div style="font-size:11px;letter-spacing:.14em;color:#b28747;font-weight:700">SOTOBOATS</div><h1>Gestor Portal</h1><p>Marbella Sailing School S.L. · Read-only finance access</p></div></div><div class="actions"><a class="btn" href="/gestor-logout">Log out</a></div></header>
+
+    <section class="card"><form method="get" action="/gestor-portal" class="actions"><label><strong>Month</strong><br><input style="margin-top:6px;padding:9px;border:1px solid #d5dde2;border-radius:8px" type="month" name="month" value="${esc(month)}"></label><button class="btn gold" style="margin-top:21px">Load month</button><a class="btn" style="margin-top:21px" href="/gestor/income.csv?month=${encodeURIComponent(month)}">Income CSV</a><a class="btn" style="margin-top:21px" href="/gestor/expenses.csv?month=${encodeURIComponent(month)}">Expenses CSV</a><a class="btn gold" style="margin-top:21px" href="/gestor/pack.zip?month=${encodeURIComponent(month)}">Download Gestor Pack</a></form></section>
+
+    <div class="metrics">
+      <div class="metric"><small>Payments received</small><strong>${euro(received)}</strong></div>
+      <div class="metric"><small>Invoices paid into</small><strong>${income.length}</strong></div>
+      <div class="metric"><small>Credit notes</small><strong>${euro(creditTotal)}</strong></div>
+      <div class="metric"><small>Expenses gross</small><strong>${euro(expenseTotal)}</strong></div>
+      <div class="metric"><small>Expense VAT</small><strong>${euro(expenseVat)}</strong></div>
+    </div>
+
+    <section class="card"><div class="section-head"><div><h2>Income received — ${esc(monthLabel(month))}</h2><p class="sub">Based on payment received date, including partial payments.</p></div></div>${incomeTable}</section>
+    <section class="card"><div class="section-head"><div><h2>Credit notes — ${esc(monthLabel(month))}</h2></div></div>${creditTable}</section>
+    <section class="card"><div class="section-head"><div><h2>Expenses — ${esc(monthLabel(month))}</h2><p class="sub">Net ${euro(expenseNet)} · VAT ${euro(expenseVat)} · Gross ${euro(expenseTotal)}</p></div></div>${expenseTable}</section>
+  </div></body></html>`;
+
+  res.send(page);
+});
+
+app.get('/gestor/income.csv',requireGestorAuth,async(req,res)=>{
+  const tenant=await getTenant();
+  const month=normaliseMonth(req.query.month);
+  if(!month)return res.status(400).send('Choose a valid month.');
+  const rows=await monthEndIncomeRows(tenant.id,month);
+  res.type('text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Income-${month}.csv"`);
+  res.send('\uFEFF'+monthEndIncomeCsv(rows,month));
+});
+
+app.get('/gestor/expenses.csv',requireGestorAuth,async(req,res)=>{
+  const tenant=await getTenant();
+  const month=normaliseMonth(req.query.month);
+  if(!month)return res.status(400).send('Choose a valid month.');
+  const rows=await monthEndExpenseRows(tenant.id,month);
+  res.type('text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Expenses-${month}.csv"`);
+  res.send('\uFEFF'+monthEndExpensesCsv(rows,month));
+});
+
+app.get('/gestor/invoices/:id/pdf',requireGestorAuth,async(req,res)=>{
+  try{
+    const data=await loadInvoice(req.params.id);
+    if(!data||!data.invoice.locked_at)return res.status(404).send('Issued invoice not found.');
+    const pdf=await buildInvoicePdfBuffer(data);
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition',`inline; filename="Sotoboats-Invoice-${data.invoice.invoice_number}.pdf"`);
+    res.send(pdf);
+  }catch(err){res.status(500).send(esc(err.message));}
+});
+
+app.get('/gestor/credit-notes/:id/pdf',requireGestorAuth,async(req,res)=>{
+  try{
+    const data=await loadCreditNote(req.params.id);
+    if(!data||!data.note.locked_at)return res.status(404).send('Issued credit note not found.');
+    const pdf=await buildCreditNotePdfBuffer(data);
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition',`inline; filename="Sotoboats-Credit-Note-${data.note.credit_note_number}.pdf"`);
+    res.send(pdf);
+  }catch(err){res.status(500).send(esc(err.message));}
+});
+
+app.get('/gestor/expenses/:id/file',requireGestorAuth,async(req,res)=>{
+  const tenant=await getTenant();
+  const e=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!e)return res.status(404).send('Expense not found.');
+  if(e.source_type==='google_drive' && e.source_drive_url)return res.redirect(e.source_drive_url);
+  if(!e.source_file_path||!fs.existsSync(e.source_file_path))return res.status(404).send('Expense document not found.');
+  res.download(e.source_file_path,e.source_file_name||'expense-document');
+});
+
+app.get('/gestor/pack.zip',requireGestorAuth,async(req,res)=>{
+  try{
+    const tenant=await getTenant();
+    const month=normaliseMonth(req.query.month);
+    if(!month)return res.status(400).send('Choose a valid month.');
+
+    const income=await monthEndIncomeRows(tenant.id,month);
+    const credits=await monthEndCreditRows(tenant.id,month);
+    const expenses=await monthEndExpenseRows(tenant.id,month);
+
+    res.setHeader('Content-Type','application/zip');
+    res.setHeader('Content-Disposition',`attachment; filename="Sotoboats-Gestor-Pack-${month}.zip"`);
+
+    const archive=archiver('zip',{zlib:{level:9}});
+    archive.on('error',err=>{throw err;});
+    archive.pipe(res);
+
+    archive.append('\uFEFF'+monthEndIncomeCsv(income,month),{name:`Sotoboats-Income-${month}.csv`});
+    if(credits.length)archive.append('\uFEFF'+monthEndCreditsCsv(credits,month),{name:`Sotoboats-Credit-Notes-${month}.csv`});
+    if(expenses.length)archive.append('\uFEFF'+monthEndExpensesCsv(expenses,month),{name:`Sotoboats-Expenses-${month}.csv`});
+
+    const summaryLines=[
+      `Sotoboats Gestor Pack – ${monthLabel(month)}`,'',
+      `Payments received: ${euro(income.reduce((s,r)=>s+Number(r.received_in_month_minor||0),0))}`,
+      `Invoices with payments: ${income.length}`,
+      `Credit notes issued: ${credits.length}`,
+      `Credit-note total: ${euro(credits.reduce((s,r)=>s+Number(r.total_minor||0),0))}`,
+      `Expenses captured: ${expenses.length}`,
+      `Expense total: ${euro(expenses.reduce((s,r)=>s+Number(r.total_minor||0),0))}`,
+      `Expense VAT: ${euro(expenses.reduce((s,r)=>s+Number(r.tax_minor||0),0))}`,'',
+      'Income selection basis: payment received date.',
+      'Partial payments are included only for the amount received during the selected month.'
+    ];
+    archive.append(summaryLines.join('\n'),{name:`README-${month}.txt`});
+
+    for(const row of income){
+      const data=await loadInvoice(row.invoice_id);
+      if(!data||!data.invoice.locked_at)continue;
+      const pdf=await buildInvoicePdfBuffer(data);
+      const safeNo=String(data.invoice.invoice_number||row.invoice_id).replace(/[^a-zA-Z0-9._-]/g,'_');
+      archive.append(pdf,{name:`Invoices/Sotoboats-Invoice-${safeNo}.pdf`});
+    }
+
+    for(const row of credits){
+      const data=await loadCreditNote(row.credit_note_id);
+      if(!data||!data.note.locked_at)continue;
+      const pdf=await buildCreditNotePdfBuffer(data);
+      const safeNo=String(data.note.credit_note_number||row.credit_note_id).replace(/[^a-zA-Z0-9._-]/g,'_');
+      archive.append(pdf,{name:`Credit Notes/Sotoboats-Credit-Note-${safeNo}.pdf`});
+    }
+
+    for(const e of expenses){
+      const safeSupplier=safeUploadName(e.supplier_name||'Expense');
+      const safeFile=safeUploadName(e.source_file_name||'expense-document');
+      const safeDate=fmtDate(e.expense_date).replace(/\//g,'-');
+      const zipName=`Expenses/${safeDate}-${safeSupplier}-${safeFile}`;
+      if(e.source_type==='google_drive' && e.source_drive_file_id){
+        try{
+          const buf=await downloadDriveFileBuffer(e.source_drive_file_id,tenant.id);
+          archive.append(buf,{name:zipName});
+        }catch(err){
+          console.error(`Could not add Drive expense ${e.source_drive_file_id} to Gestor pack:`,err.message);
+        }
+      }else if(e.source_file_path && fs.existsSync(e.source_file_path)){
+        archive.file(e.source_file_path,{name:zipName});
+      }
+    }
+
+    await archive.finalize();
+  }catch(err){
+    console.error('Gestor pack failed:',err);
+    if(!res.headersSent)res.status(500).send(esc(err.message));
+    else res.end();
+  }
+});
+
 app.use(requireAuth);
 
 app.get('/google/connect',async(req,res)=>{
@@ -2509,7 +2707,7 @@ app.get('/month-end',async(req,res)=>{
 
   const content=`<section class="card">
     <div class="actions" style="justify-content:space-between;align-items:end">
-      <div><h2 style="margin:0">Gestor / Month End</h2><p class="sub" style="margin:5px 0 0">Income is grouped by the date payment was actually received.</p></div>
+      <div><h2 style="margin:0">Gestor / Month End</h2><p class="sub" style="margin:5px 0 0">Income is grouped by the date payment was actually received.</p><p class="sub"><a href="/gestor-portal" target="_blank">Open Gestor Portal ↗</a></p></div>
       <form method="get" action="/month-end" class="actions" style="align-items:end">
         <label>Month<input type="month" name="month" value="${esc(month)}"></label>
         <button class="btn gold">Load month</button>
