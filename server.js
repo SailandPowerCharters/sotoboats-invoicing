@@ -6,6 +6,7 @@ const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
 const archiver = require('archiver');
 const multer = require('multer');
+const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
@@ -23,6 +24,65 @@ const expenseUpload = multer({
     else cb(new Error('Only PDF, JPG, PNG and WEBP expense files are supported.'));
   }
 });
+
+const DEFAULT_EXPENSES_DRIVE_FOLDER_ID = '1yGXHerNzGYoW-WHVq3WZYCtNR_HwFG3w';
+
+function driveFolderId() {
+  return String(process.env.EXPENSES_DRIVE_FOLDER_ID || DEFAULT_EXPENSES_DRIVE_FOLDER_ID).trim();
+}
+
+function googleCredentials() {
+  const raw = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (!raw) throw new Error('Google Drive is not configured yet. Add GOOGLE_SERVICE_ACCOUNT_JSON in Render.');
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.');
+  }
+}
+
+function driveClient() {
+  const credentials = googleCredentials();
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive.readonly']
+  });
+  return google.drive({ version: 'v3', auth });
+}
+
+function isSupportedExpenseMime(mime) {
+  return ['application/pdf','image/jpeg','image/png','image/webp'].includes(String(mime||''));
+}
+
+async function listExpenseDriveFiles() {
+  const drive = driveClient();
+  const folderId = driveFolderId();
+  const files = [];
+  let pageToken = null;
+  do {
+    const r = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'nextPageToken,files(id,name,mimeType,createdTime,modifiedTime,webViewLink,size)',
+      orderBy: 'createdTime desc',
+      pageSize: 1000,
+      pageToken: pageToken || undefined,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true
+    });
+    files.push(...(r.data.files || []));
+    pageToken = r.data.nextPageToken || null;
+  } while (pageToken);
+  return files.filter(f => isSupportedExpenseMime(f.mimeType));
+}
+
+async function downloadDriveFileBuffer(fileId) {
+  const drive = driveClient();
+  const r = await drive.files.get(
+    { fileId, alt: 'media', supportsAllDrives: true },
+    { responseType: 'arraybuffer' }
+  );
+  return Buffer.from(r.data);
+}
 
 app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -740,18 +800,98 @@ app.post('/customers/import',async(req,res)=>{
 app.get('/expenses',async(req,res)=>{
   const tenant=await getTenant();
   const q=String(req.query.q||'').trim();
+  const syncMsg=String(req.query.sync||'').trim();
   const params=[tenant.id];
   let where='tenant_id=$1';
   if(q){
     params.push(`%${q}%`);
     const p=params.length;
-    where+=` AND (COALESCE(supplier_name,'') ILIKE $${p} OR COALESCE(document_number,'') ILIKE $${p} OR COALESCE(category,'') ILIKE $${p} OR COALESCE(description,'') ILIKE $${p})`;
+    where+=` AND (COALESCE(supplier_name,'') ILIKE $${p} OR COALESCE(document_number,'') ILIKE $${p} OR COALESCE(category,'') ILIKE $${p} OR COALESCE(description,'') ILIKE $${p} OR COALESCE(source_file_name,'') ILIKE $${p})`;
   }
   const rows=(await pool.query(`SELECT * FROM expense_records WHERE ${where} ORDER BY COALESCE(expense_date,created_at::date) DESC,created_at DESC`,params)).rows;
-  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th>File</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td>${fmtDate(r.expense_date)}</td><td><strong>${esc(r.supplier_name||'—')}</strong></td><td>${esc(r.document_number||'—')}</td><td>${esc(r.category||'—')}</td><td>${euro(r.net_minor)}</td><td>${euro(r.tax_minor)}</td><td><strong>${euro(r.total_minor)}</strong></td><td>${r.source_file_name?`<a class="btn light" href="/expenses/${r.id}/file" target="_blank">Open file</a>`:'—'}</td><td><a class="btn light" href="/expenses/${r.id}/edit">Edit</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured yet.</p>';
-  const content=`<section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:14px"><div><h2 style="margin:0">Expenses</h2><p class="sub" style="margin:4px 0 0">Capture supplier invoices and receipts for the Gestor pack.</p></div><a class="btn gold" href="/expenses/new">Add expense</a></div><form method="get" action="/expenses" class="actions" style="margin-bottom:14px;align-items:end"><label style="min-width:300px">Search expenses<input name="q" value="${esc(q)}" placeholder="Supplier, document number, category"></label><button class="btn light">Search</button>${q?'<a class="btn light" href="/expenses">Clear</a>':''}</form>${table}</section><section class="card"><h2>Google Drive intake</h2><p class="sub">Next step: connect a shared Google Drive folder so new scans automatically appear here. For now, uploads can be added directly.</p></section>`;
+
+  const driveConfigured=!!String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON||'').trim();
+  const needsDetails=rows.filter(r=>r.extraction_status==='check_details').length;
+
+  const table=rows.length?`<div class="table-wrap"><table>
+    <thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th>Source</th><th></th></tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td>${fmtDate(r.expense_date)}</td>
+      <td><strong>${esc(r.supplier_name||'Check details')}</strong>${r.extraction_status==='check_details'?'<br><span class="pill">Check details</span>':''}</td>
+      <td>${esc(r.document_number||r.source_file_name||'—')}</td>
+      <td>${esc(r.category||'—')}</td>
+      <td>${euro(r.net_minor)}</td>
+      <td>${euro(r.tax_minor)}</td>
+      <td><strong>${euro(r.total_minor)}</strong></td>
+      <td>${r.source_type==='google_drive'?'<span class="pill green">Google Drive</span>':'<span class="pill">Manual</span>'}</td>
+      <td><div class="actions">${(r.source_drive_url||r.source_file_name)?`<a class="btn light" href="/expenses/${r.id}/file" target="_blank">Open file</a>`:''}<a class="btn light" href="/expenses/${r.id}/edit">Edit</a></div></td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured yet.</p>';
+
+  const banner=syncMsg?`<section class="card" style="border-left:4px solid #caa86d"><strong>${esc(syncMsg)}</strong></section>`:'';
+
+  const content=`${banner}<section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:14px">
+      <div><h2 style="margin:0">Expenses</h2><p class="sub" style="margin:4px 0 0">Receipts and supplier invoices feeding the Gestor pack.</p></div>
+      <div class="actions">
+        <form method="post" action="/expenses/drive-sync"><button class="btn ${driveConfigured?'gold':'light'}" ${driveConfigured?'':'disabled'}>Sync Google Drive</button></form>
+        <a class="btn light" href="/expenses/new">Add manually</a>
+      </div>
+    </div>
+    ${needsDetails?`<p><span class="pill">${needsDetails} need details</span> <span class="sub">Drive files are imported once; open them and add the accounting details until automatic extraction is added.</span></p>`:''}
+    <form method="get" action="/expenses" class="actions" style="margin-bottom:14px;align-items:end">
+      <label style="min-width:300px">Search expenses<input name="q" value="${esc(q)}" placeholder="Supplier, document number, category or file"></label>
+      <button class="btn light">Search</button>${q?'<a class="btn light" href="/expenses">Clear</a>':''}
+    </form>
+    ${table}
+  </section>
+  <section class="card">
+    <h2>Google Drive intake</h2>
+    <p class="sub">Folder: <strong>Sotoboats → Accounts → Expenses Inbox</strong></p>
+    <p class="sub">${driveConfigured?'Drive access is configured. Sync imports only new PDF/JPG/PNG/WEBP files and will not duplicate files already seen.':'One Render credential is still required before the app itself can read Drive. See the V17 setup instructions.'}</p>
+  </section>`;
   res.send(shell('Expenses','expenses',content,'Supplier bills, receipts and supporting documents.'));
 });
+
+app.post('/expenses/drive-sync',async(req,res)=>{
+  try{
+    const tenant=await getTenant();
+    const files=await listExpenseDriveFiles();
+    let imported=0,existing=0;
+
+    for(const f of files){
+      const found=(await pool.query(`
+        SELECT id FROM expense_records
+        WHERE tenant_id=$1 AND source_drive_file_id=$2
+        LIMIT 1
+      `,[tenant.id,f.id])).rows[0];
+
+      if(found){existing++;continue;}
+
+      await pool.query(`
+        INSERT INTO expense_records(
+          tenant_id,description,source_type,source_file_name,source_drive_url,
+          source_drive_file_id,source_mime_type,extraction_status,notes
+        ) VALUES($1,$2,'google_drive',$3,$4,$5,$6,'check_details',$7)
+      `,[
+        tenant.id,
+        f.name || 'Google Drive expense document',
+        f.name || null,
+        f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
+        f.id,
+        f.mimeType || null,
+        'Imported from Google Drive. Add supplier, expense date and amounts.'
+      ]);
+      imported++;
+    }
+
+    const message=`Google Drive sync complete: ${imported} new file${imported===1?'':'s'} imported${existing?`, ${existing} already present`:''}.`;
+    res.redirect('/expenses?sync='+encodeURIComponent(message));
+  }catch(err){
+    console.error('Drive sync failed:',err);
+    res.status(400).send(shell('Google Drive sync error','expenses',`<section class="card"><h2>Could not sync Google Drive</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/expenses">Back to expenses</a></section>`));
+  }
+});
+
 
 function expenseForm(e={},action='/expenses/new',heading='Add expense'){
   return `<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${esc(heading)}</h2><p class="sub">No approval step — capture it, correct it if needed, and it flows into the Gestor pack.</p></div><a class="btn light" href="/expenses">Back to expenses</a></div><form method="post" action="${action}" enctype="multipart/form-data" id="expenseForm"><div class="form-grid three"><label>Expense date<input type="date" name="expense_date" value="${iso(e.expense_date)}"></label><label>Supplier<input name="supplier_name" value="${esc(e.supplier_name||'')}" required></label><label>Supplier Tax ID<input name="supplier_tax_id" value="${esc(e.supplier_tax_id||'')}"></label><label>Invoice / receipt number<input name="document_number" value="${esc(e.document_number||'')}"></label><label>Category<select name="category">${['Fuel','Marina / Berthing','Maintenance / Repairs','Boat Supplies','Training / Courses','Travel / Subsistence','Cleaning','Office / Admin','Marketing','Insurance','Professional Fees','Other'].map(x=>`<option value="${x}" ${e.category===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Payment method<select name="payment_method">${['Bank transfer','Card','Cash','Direct debit','Other'].map(x=>`<option value="${x}" ${e.payment_method===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Net €<input id="expenseNet" type="number" step="0.01" min="0" name="net_amount" value="${major(e.net_minor||0).toFixed(2)}"></label><label>VAT rate %<input id="expenseVatRate" type="number" step="0.01" min="0" name="tax_rate" value="${e.tax_rate==null?'21':Number(e.tax_rate)}"></label><label>VAT €<input id="expenseVat" type="number" step="0.01" min="0" name="tax_amount" value="${major(e.tax_minor||0).toFixed(2)}"></label><label>Gross total €<input id="expenseTotal" type="number" step="0.01" min="0" name="total_amount" value="${major(e.total_minor||0).toFixed(2)}" required></label><label class="full">Description<input name="description" value="${esc(e.description||'')}"></label><label class="full">Notes<textarea name="notes">${esc(e.notes||'')}</textarea></label><label class="full">Receipt / supplier invoice<input type="file" name="expense_file" accept=".pdf,image/jpeg,image/png,image/webp"></label></div>${e.source_file_name?`<p class="sub">Current file: ${esc(e.source_file_name)} · upload a new file only to replace it.</p>`:''}<div class="actions"><button class="btn gold">Save expense</button></div></form></section><script>(function(){const net=document.getElementById('expenseNet'),rate=document.getElementById('expenseVatRate'),vat=document.getElementById('expenseVat'),total=document.getElementById('expenseTotal');function calc(){const n=parseFloat(net.value)||0,r=parseFloat(rate.value)||0,v=n*r/100;vat.value=v.toFixed(2);total.value=(n+v).toFixed(2);}net.addEventListener('input',calc);rate.addEventListener('input',calc);})();</script>`;
@@ -792,7 +932,9 @@ app.post('/expenses/:id/edit',expenseUpload.single('expense_file'),async(req,res
 app.get('/expenses/:id/file',async(req,res)=>{
   const tenant=await getTenant();
   const e=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
-  if(!e||!e.source_file_path||!fs.existsSync(e.source_file_path))return res.status(404).send('Expense file not found.');
+  if(!e)return res.status(404).send('Expense not found.');
+  if(e.source_type==='google_drive' && e.source_drive_url)return res.redirect(e.source_drive_url);
+  if(!e.source_file_path||!fs.existsSync(e.source_file_path))return res.status(404).send('Expense file not found.');
   res.download(e.source_file_path,e.source_file_name||'expense-document');
 });
 
@@ -2084,11 +2226,21 @@ app.get('/month-end/gestor-pack.zip',async(req,res)=>{
 
 
     for(const e of expenses){
-      if(!e.source_file_path||!fs.existsSync(e.source_file_path))continue;
       const safeSupplier=safeUploadName(e.supplier_name||'Expense');
-      const safeFile=safeUploadName(e.source_file_name||path.basename(e.source_file_path));
+      const safeFile=safeUploadName(e.source_file_name||'expense-document');
       const safeDate=fmtDate(e.expense_date).replace(/\//g,'-');
-      archive.file(e.source_file_path,{name:`Expenses/${safeDate}-${safeSupplier}-${safeFile}`});
+      const zipName=`Expenses/${safeDate}-${safeSupplier}-${safeFile}`;
+
+      if(e.source_type==='google_drive' && e.source_drive_file_id){
+        try{
+          const buf=await downloadDriveFileBuffer(e.source_drive_file_id);
+          archive.append(buf,{name:zipName});
+        }catch(err){
+          console.error(`Could not add Drive expense ${e.source_drive_file_id} to Gestor pack:`,err.message);
+        }
+      }else if(e.source_file_path && fs.existsSync(e.source_file_path)){
+        archive.file(e.source_file_path,{name:zipName});
+      }
     }
 
     await archive.finalize();
@@ -2233,12 +2385,23 @@ async function initialiseDatabase() {
       source_file_name TEXT,
       source_file_path TEXT,
       source_drive_url TEXT,
+      source_drive_file_id TEXT,
+      source_mime_type TEXT,
       extraction_status TEXT NOT NULL DEFAULT 'manual',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_expense_records_tenant_date
       ON expense_records(tenant_id, expense_date);
+  `);
+
+  await pool.query(`
+    ALTER TABLE expense_records
+      ADD COLUMN IF NOT EXISTS source_drive_file_id TEXT,
+      ADD COLUMN IF NOT EXISTS source_mime_type TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_drive_file_unique
+      ON expense_records(tenant_id, source_drive_file_id)
+      WHERE source_drive_file_id IS NOT NULL;
   `);
   console.log('Sotoboats invoicing database schema checked / initialised.');
 }
