@@ -128,6 +128,257 @@ async function downloadDriveFileBuffer(fileId, tenantId) {
   return Buffer.from(r.data);
 }
 
+const EXPENSE_CATEGORIES = [
+  'Fuel',
+  'Marina / Berthing',
+  'Maintenance / Repairs',
+  'Boat Supplies',
+  'Training / Courses',
+  'Travel / Subsistence',
+  'Cleaning',
+  'Office / Admin',
+  'Marketing',
+  'Insurance',
+  'Professional Fees',
+  'Other'
+];
+
+function geminiExpenseConfigured() {
+  return !!String(process.env.GEMINI_API_KEY||'').trim();
+}
+
+function expenseMimeFromName(name='') {
+  const ext=path.extname(String(name||'')).toLowerCase();
+  if(ext==='.pdf') return 'application/pdf';
+  if(ext==='.jpg'||ext==='.jpeg') return 'image/jpeg';
+  if(ext==='.png') return 'image/png';
+  if(ext==='.webp') return 'image/webp';
+  return 'application/octet-stream';
+}
+
+function cleanExpenseCategory(value) {
+  const raw=String(value||'').trim();
+  return EXPENSE_CATEGORIES.includes(raw)?raw:'Other';
+}
+
+function cleanPaymentMethod(value) {
+  const raw=String(value||'').trim();
+  const allowed=['Bank transfer','Card','Cash','Direct debit','Other',''];
+  return allowed.includes(raw)?raw:'Other';
+}
+
+function safeExpenseDate(value) {
+  const s=String(value||'').trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return null;
+}
+
+function expenseMoneyMinor(value) {
+  const n=Number(value);
+  if(!Number.isFinite(n) || n<0) return 0;
+  return Math.round(n*100);
+}
+
+async function extractExpenseDocument(buffer, mimeType, fileName='expense-document') {
+  const apiKey=String(process.env.GEMINI_API_KEY||'').trim();
+  if(!apiKey) throw new Error('Automatic document reading is not configured. Add GEMINI_API_KEY in Render.');
+
+  if(!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('Expense document is empty.');
+  const maxBytes = mimeType==='application/pdf' ? 45*1024*1024 : 80*1024*1024;
+  if(buffer.length>maxBytes) throw new Error('This expense document is too large for automatic reading.');
+
+  const prompt = `Read this supplier invoice or receipt for Sotoboats / Marbella Sailing School S.L.
+
+Extract accounting details from the document. Do not invent values that are not supported by the document.
+Amounts must be numeric EUR amounts, without currency symbols.
+Use the supplier/merchant as supplier_name, not Sotoboats.
+For expense_date use YYYY-MM-DD.
+For category choose exactly one of:
+${EXPENSE_CATEGORIES.join(', ')}.
+
+Payment method must be one of: Bank transfer, Card, Cash, Direct debit, Other, or an empty string when not visible.
+
+For net_amount, vat_amount and gross_amount:
+- prefer explicit document totals;
+- arithmetic may be used only where the document clearly supports it;
+- gross_amount should be the final amount payable/paid on the receipt or invoice;
+- if there are multiple VAT rates, keep tax_rate as 0 and explain this in extraction_notes;
+- if a field cannot be determined, use an empty string for text or 0 for numeric fields.
+
+Set confidence between 0 and 1 for the overall extraction.
+Use extraction_notes for anything Dave should check.`;
+
+  const body={
+    contents:[{
+      parts:[
+        {text:prompt},
+        {inlineData:{mimeType,data:buffer.toString('base64')}}
+      ]
+    }],
+    generationConfig:{
+      responseMimeType:'application/json',
+      responseSchema:{
+        type:'OBJECT',
+        properties:{
+          supplier_name:{type:'STRING'},
+          supplier_tax_id:{type:'STRING'},
+          document_number:{type:'STRING'},
+          expense_date:{type:'STRING'},
+          category:{type:'STRING',enum:EXPENSE_CATEGORIES},
+          description:{type:'STRING'},
+          net_amount:{type:'NUMBER'},
+          vat_amount:{type:'NUMBER'},
+          gross_amount:{type:'NUMBER'},
+          tax_rate:{type:'NUMBER'},
+          payment_method:{type:'STRING'},
+          confidence:{type:'NUMBER'},
+          extraction_notes:{type:'STRING'}
+        },
+        required:[
+          'supplier_name','supplier_tax_id','document_number','expense_date','category','description',
+          'net_amount','vat_amount','gross_amount','tax_rate','payment_method','confidence','extraction_notes'
+        ]
+      }
+    }
+  };
+
+  const resp=await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent',
+    {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'x-goog-api-key':apiKey
+      },
+      body:JSON.stringify(body)
+    }
+  );
+
+  if(!resp.ok){
+    const txt=await resp.text();
+    throw new Error(`Document reader returned ${resp.status}: ${txt.slice(0,500)}`);
+  }
+
+  const data=await resp.json();
+  const text=data?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();
+  if(!text) throw new Error('Document reader did not return extracted details.');
+
+  let parsed;
+  try{ parsed=JSON.parse(text); }
+  catch(err){ throw new Error('Document reader returned invalid structured data.'); }
+
+  const confidence=Math.max(0,Math.min(1,Number(parsed.confidence)||0));
+  let net=expenseMoneyMinor(parsed.net_amount);
+  let vat=expenseMoneyMinor(parsed.vat_amount);
+  let gross=expenseMoneyMinor(parsed.gross_amount);
+
+  // Only fill simple missing arithmetic relationships; never override explicit non-zero values.
+  if(!gross && net+vat>0) gross=net+vat;
+  if(!vat && gross>0 && net>0 && gross>=net) vat=gross-net;
+  if(!net && gross>0 && vat>=0 && gross>=vat) net=gross-vat;
+
+  return {
+    supplier_name:String(parsed.supplier_name||'').trim()||null,
+    supplier_tax_id:String(parsed.supplier_tax_id||'').trim()||null,
+    document_number:String(parsed.document_number||'').trim()||null,
+    expense_date:safeExpenseDate(parsed.expense_date),
+    category:cleanExpenseCategory(parsed.category),
+    description:String(parsed.description||'').trim()||fileName||'Expense document',
+    net_minor:net,
+    tax_minor:vat,
+    total_minor:gross,
+    tax_rate:Number.isFinite(Number(parsed.tax_rate))?Math.max(0,Number(parsed.tax_rate)):0,
+    payment_method:cleanPaymentMethod(parsed.payment_method)||null,
+    extraction_confidence:confidence,
+    extraction_notes:String(parsed.extraction_notes||'').trim()||null
+  };
+}
+
+function extractionLooksComplete(x) {
+  return !!(
+    x &&
+    x.supplier_name &&
+    x.expense_date &&
+    Number(x.total_minor)>0 &&
+    Number(x.extraction_confidence)>=0.78
+  );
+}
+
+async function applyExpenseExtraction(expenseId, tenantId, extracted) {
+  const status=extractionLooksComplete(extracted)?'extracted':'check_details';
+  await pool.query(`
+    UPDATE expense_records SET
+      supplier_name=$1,
+      supplier_tax_id=$2,
+      document_number=$3,
+      expense_date=$4,
+      category=$5,
+      description=$6,
+      net_minor=$7,
+      tax_minor=$8,
+      total_minor=$9,
+      tax_rate=$10,
+      payment_method=$11,
+      extraction_status=$12,
+      extraction_confidence=$13,
+      extraction_notes=$14,
+      extracted_at=now(),
+      notes=CASE
+        WHEN COALESCE(notes,'')='' THEN COALESCE($14,'')
+        ELSE notes
+      END,
+      updated_at=now()
+    WHERE id=$15 AND tenant_id=$16
+  `,[
+    extracted.supplier_name,
+    extracted.supplier_tax_id,
+    extracted.document_number,
+    extracted.expense_date,
+    extracted.category,
+    extracted.description,
+    extracted.net_minor,
+    extracted.tax_minor,
+    extracted.total_minor,
+    extracted.tax_rate,
+    extracted.payment_method,
+    status,
+    extracted.extraction_confidence,
+    extracted.extraction_notes,
+    expenseId,
+    tenantId
+  ]);
+  return status;
+}
+
+async function expenseDocumentBuffer(expense, tenantId) {
+  if(expense.source_type==='google_drive' && expense.source_drive_file_id){
+    return {
+      buffer:await downloadDriveFileBuffer(expense.source_drive_file_id,tenantId),
+      mimeType:expense.source_mime_type||expenseMimeFromName(expense.source_file_name),
+      fileName:expense.source_file_name||'expense-document'
+    };
+  }
+  if(expense.source_file_path && fs.existsSync(expense.source_file_path)){
+    return {
+      buffer:fs.readFileSync(expense.source_file_path),
+      mimeType:expense.source_mime_type||expenseMimeFromName(expense.source_file_name),
+      fileName:expense.source_file_name||path.basename(expense.source_file_path)
+    };
+  }
+  throw new Error('No readable document is attached to this expense.');
+}
+
+async function readAndApplyExpense(expenseId, tenantId) {
+  const expense=(await pool.query(`
+    SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2
+  `,[expenseId,tenantId])).rows[0];
+  if(!expense) throw new Error('Expense not found.');
+  const doc=await expenseDocumentBuffer(expense,tenantId);
+  const extracted=await extractExpenseDocument(doc.buffer,doc.mimeType,doc.fileName);
+  const status=await applyExpenseExtraction(expense.id,tenantId,extracted);
+  return {status,extracted};
+}
+
 app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
@@ -916,21 +1167,36 @@ app.get('/expenses',async(req,res)=>{
   const driveConfigured=googleOAuthConfigured();
   const driveConnectionRow=await driveConnection(tenant.id);
   const driveConnected=!!driveConnectionRow?.google_drive_refresh_token_enc;
+  const readerConfigured=geminiExpenseConfigured();
   const needsDetails=rows.filter(r=>r.extraction_status==='check_details').length;
+  const extractedCount=rows.filter(r=>r.extraction_status==='extracted').length;
 
   const table=rows.length?`<div class="table-wrap"><table>
-    <thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th>Source</th><th></th></tr></thead>
-    <tbody>${rows.map(r=>`<tr>
-      <td>${fmtDate(r.expense_date)}</td>
-      <td><strong>${esc(r.supplier_name||'Check details')}</strong>${r.extraction_status==='check_details'?'<br><span class="pill">Check details</span>':''}</td>
-      <td>${esc(r.document_number||r.source_file_name||'—')}</td>
-      <td>${esc(r.category||'—')}</td>
-      <td>${euro(r.net_minor)}</td>
-      <td>${euro(r.tax_minor)}</td>
-      <td><strong>${euro(r.total_minor)}</strong></td>
-      <td>${r.source_type==='google_drive'?'<span class="pill green">Google Drive</span>':'<span class="pill">Manual</span>'}</td>
-      <td><div class="actions">${(r.source_drive_url||r.source_file_name)?`<a class="btn light" href="/expenses/${r.id}/file" target="_blank">Open file</a>`:''}<a class="btn light" href="/expenses/${r.id}/edit">Edit</a></div></td>
-    </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured yet.</p>';
+    <thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th>Status</th><th></th></tr></thead>
+    <tbody>${rows.map(r=>{
+      const conf=r.extraction_confidence==null?'':` ${Math.round(Number(r.extraction_confidence)*100)}%`;
+      const status=r.extraction_status==='extracted'
+        ?`<span class="pill green">Read${conf}</span>`
+        :r.extraction_status==='check_details'
+          ?`<span class="pill">Check details${conf}</span>`
+          :`<span class="pill">Manual</span>`;
+      const canRead=readerConfigured&&(r.source_drive_file_id||r.source_file_path);
+      return `<tr>
+        <td>${fmtDate(r.expense_date)}</td>
+        <td><strong>${esc(r.supplier_name||'Check details')}</strong></td>
+        <td>${esc(r.document_number||r.source_file_name||'—')}</td>
+        <td>${esc(r.category||'—')}</td>
+        <td>${euro(r.net_minor)}</td>
+        <td>${euro(r.tax_minor)}</td>
+        <td><strong>${euro(r.total_minor)}</strong></td>
+        <td>${status}</td>
+        <td><div class="actions">
+          ${(r.source_drive_url||r.source_file_name)?`<a class="btn light" href="/expenses/${r.id}/file" target="_blank">Open file</a>`:''}
+          ${canRead?`<form method="post" action="/expenses/${r.id}/extract"><button class="btn light">${r.extracted_at?'Read again':'Read document'}</button></form>`:''}
+          <a class="btn light" href="/expenses/${r.id}/edit">Edit</a>
+        </div></td>
+      </tr>`;
+    }).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured yet.</p>';
 
   const banner=syncMsg?`<section class="card" style="border-left:4px solid #caa86d"><strong>${esc(syncMsg)}</strong></section>`:'';
 
@@ -943,7 +1209,11 @@ app.get('/expenses',async(req,res)=>{
         <a class="btn light" href="/expenses/new">Add manually</a>
       </div>
     </div>
-    ${needsDetails?`<p><span class="pill">${needsDetails} need details</span> <span class="sub">Drive files are imported once; open them and add the accounting details until automatic extraction is added.</span></p>`:''}
+    <div class="actions" style="margin-bottom:12px">
+      ${extractedCount?`<span class="pill green">${extractedCount} automatically read</span>`:''}
+      ${needsDetails?`<span class="pill">${needsDetails} need checking</span>`:''}
+      ${!readerConfigured?`<span class="pill">Automatic reader not configured</span>`:''}
+    </div>
     <form method="get" action="/expenses" class="actions" style="margin-bottom:14px;align-items:end">
       <label style="min-width:300px">Search expenses<input name="q" value="${esc(q)}" placeholder="Supplier, document number, category or file"></label>
       <button class="btn light">Search</button>${q?'<a class="btn light" href="/expenses">Clear</a>':''}
@@ -954,6 +1224,7 @@ app.get('/expenses',async(req,res)=>{
     <h2>Google Drive intake</h2>
     <p class="sub">Folder: <strong>Sotoboats → Accounts → Expenses Inbox</strong></p>
     <p class="sub">${!driveConfigured?'Google OAuth environment variables are still required in Render.':driveConnected?'Google Drive is connected. Sync imports only new PDF/JPG/PNG/WEBP files and will not duplicate files already seen.':'OAuth is configured. Click Connect Google Drive once to authorise access.'}</p>
+    <p class="sub">${readerConfigured?'Automatic document reading is active. New Drive files are read immediately after import; uncertain results are flagged for checking.':'Add GEMINI_API_KEY in Render to automatically read supplier, date, invoice number, NET, VAT, GROSS and category.'}</p>
   </section>`;
   res.send(shell('Expenses','expenses',content,'Supplier bills, receipts and supporting documents.'));
 });
@@ -962,7 +1233,7 @@ app.post('/expenses/drive-sync',async(req,res)=>{
   try{
     const tenant=await getTenant();
     const files=await listExpenseDriveFiles(tenant.id);
-    let imported=0,existing=0;
+    let imported=0,existing=0,autoRead=0,needsCheck=0,readFailed=0;
 
     for(const f of files){
       const found=(await pool.query(`
@@ -973,11 +1244,12 @@ app.post('/expenses/drive-sync',async(req,res)=>{
 
       if(found){existing++;continue;}
 
-      await pool.query(`
+      const inserted=(await pool.query(`
         INSERT INTO expense_records(
           tenant_id,description,source_type,source_file_name,source_drive_url,
           source_drive_file_id,source_mime_type,extraction_status,notes
         ) VALUES($1,$2,'google_drive',$3,$4,$5,$6,'check_details',$7)
+        RETURNING id
       `,[
         tenant.id,
         f.name || 'Google Drive expense document',
@@ -985,12 +1257,40 @@ app.post('/expenses/drive-sync',async(req,res)=>{
         f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
         f.id,
         f.mimeType || null,
-        'Imported from Google Drive. Add supplier, expense date and amounts.'
-      ]);
+        geminiExpenseConfigured()
+          ? 'Imported from Google Drive. Automatic reading attempted.'
+          : 'Imported from Google Drive. Automatic document reader is not configured.'
+      ])).rows[0];
       imported++;
+
+      if(geminiExpenseConfigured()){
+        try{
+          const result=await readAndApplyExpense(inserted.id,tenant.id);
+          if(result.status==='extracted')autoRead++;
+          else needsCheck++;
+        }catch(readErr){
+          console.error(`Automatic expense read failed for ${f.name}:`,readErr.message);
+          readFailed++;
+          await pool.query(`
+            UPDATE expense_records
+            SET extraction_status='check_details',
+                extraction_notes=$1,
+                notes=$1,
+                updated_at=now()
+            WHERE id=$2 AND tenant_id=$3
+          `,[`Automatic reading failed: ${readErr.message}`,inserted.id,tenant.id]);
+        }
+      }else{
+        needsCheck++;
+      }
     }
 
-    const message=`Google Drive sync complete: ${imported} new file${imported===1?'':'s'} imported${existing?`, ${existing} already present`:''}.`;
+    let message=`Google Drive sync complete: ${imported} new file${imported===1?'':'s'} imported`;
+    if(autoRead)message+=`, ${autoRead} automatically read`;
+    if(needsCheck)message+=`, ${needsCheck} need checking`;
+    if(readFailed)message+=`, ${readFailed} reader error${readFailed===1?'':'s'}`;
+    if(existing)message+=`, ${existing} already present`;
+    message+='.';
     res.redirect('/expenses?sync='+encodeURIComponent(message));
   }catch(err){
     console.error('Drive sync failed:',err);
@@ -998,9 +1298,25 @@ app.post('/expenses/drive-sync',async(req,res)=>{
   }
 });
 
+app.post('/expenses/:id/extract',async(req,res)=>{
+  try{
+    if(!geminiExpenseConfigured())throw new Error('Add GEMINI_API_KEY in Render before using automatic document reading.');
+    const tenant=await getTenant();
+    const result=await readAndApplyExpense(req.params.id,tenant.id);
+    const msg=result.status==='extracted'
+      ?`Document read successfully: ${result.extracted.supplier_name||'supplier'} · ${euro(result.extracted.total_minor)}.`
+      :`Document was read, but some details need checking.`;
+    res.redirect('/expenses?sync='+encodeURIComponent(msg));
+  }catch(err){
+    console.error('Expense extraction failed:',err);
+    res.status(400).send(shell('Document reading error','expenses',`<section class="card"><h2>Could not read this expense document</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/expenses">Back to expenses</a></section>`));
+  }
+});
 
 function expenseForm(e={},action='/expenses/new',heading='Add expense'){
-  return `<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${esc(heading)}</h2><p class="sub">No approval step — capture it, correct it if needed, and it flows into the Gestor pack.</p></div><a class="btn light" href="/expenses">Back to expenses</a></div><form method="post" action="${action}" enctype="multipart/form-data" id="expenseForm"><div class="form-grid three"><label>Expense date<input type="date" name="expense_date" value="${iso(e.expense_date)}"></label><label>Supplier<input name="supplier_name" value="${esc(e.supplier_name||'')}" required></label><label>Supplier Tax ID<input name="supplier_tax_id" value="${esc(e.supplier_tax_id||'')}"></label><label>Invoice / receipt number<input name="document_number" value="${esc(e.document_number||'')}"></label><label>Category<select name="category">${['Fuel','Marina / Berthing','Maintenance / Repairs','Boat Supplies','Training / Courses','Travel / Subsistence','Cleaning','Office / Admin','Marketing','Insurance','Professional Fees','Other'].map(x=>`<option value="${x}" ${e.category===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Payment method<select name="payment_method">${['Bank transfer','Card','Cash','Direct debit','Other'].map(x=>`<option value="${x}" ${e.payment_method===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Net €<input id="expenseNet" type="number" step="0.01" min="0" name="net_amount" value="${major(e.net_minor||0).toFixed(2)}"></label><label>VAT rate %<input id="expenseVatRate" type="number" step="0.01" min="0" name="tax_rate" value="${e.tax_rate==null?'21':Number(e.tax_rate)}"></label><label>VAT €<input id="expenseVat" type="number" step="0.01" min="0" name="tax_amount" value="${major(e.tax_minor||0).toFixed(2)}"></label><label>Gross total €<input id="expenseTotal" type="number" step="0.01" min="0" name="total_amount" value="${major(e.total_minor||0).toFixed(2)}" required></label><label class="full">Description<input name="description" value="${esc(e.description||'')}"></label><label class="full">Notes<textarea name="notes">${esc(e.notes||'')}</textarea></label><label class="full">Receipt / supplier invoice<input type="file" name="expense_file" accept=".pdf,image/jpeg,image/png,image/webp"></label></div>${e.source_file_name?`<p class="sub">Current file: ${esc(e.source_file_name)} · upload a new file only to replace it.</p>`:''}<div class="actions"><button class="btn gold">Save expense</button></div></form></section><script>(function(){const net=document.getElementById('expenseNet'),rate=document.getElementById('expenseVatRate'),vat=document.getElementById('expenseVat'),total=document.getElementById('expenseTotal');function calc(){const n=parseFloat(net.value)||0,r=parseFloat(rate.value)||0,v=n*r/100;vat.value=v.toFixed(2);total.value=(n+v).toFixed(2);}net.addEventListener('input',calc);rate.addEventListener('input',calc);})();</script>`;
+  return `<section class="form-card"><div class="actions" style="justify-content:space-between"><div><h2>${esc(heading)}</h2><p class="sub">No approval step — capture it, correct it if needed, and it flows into the Gestor pack.</p></div><a class="btn light" href="/expenses">Back to expenses</a></div><form method="post" action="${action}" enctype="multipart/form-data" id="expenseForm"><div class="form-grid three"><label>Expense date<input type="date" name="expense_date" value="${iso(e.expense_date)}"></label><label>Supplier<input name="supplier_name" value="${esc(e.supplier_name||'')}" required></label><label>Supplier Tax ID<input name="supplier_tax_id" value="${esc(e.supplier_tax_id||'')}"></label><label>Invoice / receipt number<input name="document_number" value="${esc(e.document_number||'')}"></label><label>Category<select name="category">${EXPENSE_CATEGORIES.map(x=>`<option value="${x}" ${e.category===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Payment method<select name="payment_method">${['Bank transfer','Card','Cash','Direct debit','Other'].map(x=>`<option value="${x}" ${e.payment_method===x?'selected':''}>${x}</option>`).join('')}</select></label><label>Net €<input id="expenseNet" type="number" step="0.01" min="0" name="net_amount" value="${major(e.net_minor||0).toFixed(2)}"></label><label>VAT rate %<input id="expenseVatRate" type="number" step="0.01" min="0" name="tax_rate" value="${e.tax_rate==null?'21':Number(e.tax_rate)}"></label><label>VAT €<input id="expenseVat" type="number" step="0.01" min="0" name="tax_amount" value="${major(e.tax_minor||0).toFixed(2)}"></label><label>Gross total €<input id="expenseTotal" type="number" step="0.01" min="0" name="total_amount" value="${major(e.total_minor||0).toFixed(2)}" required></label><label class="full">Description<input name="description" value="${esc(e.description||'')}"></label><label class="full">Notes<textarea name="notes">${esc(e.notes||'')}</textarea></label><label class="full">Receipt / supplier invoice<input type="file" name="expense_file" accept=".pdf,image/jpeg,image/png,image/webp"></label></div>${e.source_file_name?`<p class="sub">Current file: ${esc(e.source_file_name)} · upload a new file only to replace it.</p>`:''}
+      ${e.extracted_at?`<p class="sub"><strong>Automatically read:</strong> ${fmtDate(e.extracted_at)}${e.extraction_confidence!=null?` · confidence ${Math.round(Number(e.extraction_confidence)*100)}%`:''}${e.extraction_notes?` · ${esc(e.extraction_notes)}`:''}</p>`:''}
+      <div class="actions"><button class="btn gold">Save expense</button></div></form></section><script>(function(){const net=document.getElementById('expenseNet'),rate=document.getElementById('expenseVatRate'),vat=document.getElementById('expenseVat'),total=document.getElementById('expenseTotal');function calc(){const n=parseFloat(net.value)||0,r=parseFloat(rate.value)||0,v=n*r/100;vat.value=v.toFixed(2);total.value=(n+v).toFixed(2);}net.addEventListener('input',calc);rate.addEventListener('input',calc);})();</script>`;
 }
 
 app.get('/expenses/new',(req,res)=>res.send(shell('Add Expense','expenses',expenseForm(),'Capture a receipt or supplier invoice.')));
@@ -1008,8 +1324,8 @@ app.get('/expenses/new',(req,res)=>res.send(shell('Add Expense','expenses',expen
 app.post('/expenses/new',expenseUpload.single('expense_file'),async(req,res)=>{
   try{
     const tenant=await getTenant(); const b=req.body; const file=req.file||null;
-    await pool.query(`INSERT INTO expense_records(tenant_id,supplier_name,supplier_tax_id,document_number,expense_date,category,description,net_minor,tax_minor,total_minor,tax_rate,payment_method,notes,source_type,source_file_name,source_file_path,extraction_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'manual',$14,$15,'manual')`,
-      [tenant.id,b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,file?file.originalname:null,file?file.path:null]);
+    await pool.query(`INSERT INTO expense_records(tenant_id,supplier_name,supplier_tax_id,document_number,expense_date,category,description,net_minor,tax_minor,total_minor,tax_rate,payment_method,notes,source_type,source_file_name,source_file_path,source_mime_type,extraction_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'manual',$14,$15,$16,'manual')`,
+      [tenant.id,b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,file?file.originalname:null,file?file.path:null,file?file.mimetype:null]);
     res.redirect('/expenses');
   }catch(err){
     if(req.file){try{fs.unlinkSync(req.file.path);}catch(_){}}
@@ -1028,10 +1344,10 @@ app.post('/expenses/:id/edit',expenseUpload.single('expense_file'),async(req,res
   const tenant=await getTenant();
   const current=(await pool.query(`SELECT * FROM expense_records WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
   if(!current)return res.status(404).send('Expense not found.');
-  const b=req.body; let fileName=current.source_file_name,filePath=current.source_file_path;
-  if(req.file){if(filePath){try{fs.unlinkSync(filePath);}catch(_){}} fileName=req.file.originalname;filePath=req.file.path;}
-  await pool.query(`UPDATE expense_records SET supplier_name=$1,supplier_tax_id=$2,document_number=$3,expense_date=$4,category=$5,description=$6,net_minor=$7,tax_minor=$8,total_minor=$9,tax_rate=$10,payment_method=$11,notes=$12,source_file_name=$13,source_file_path=$14,updated_at=now() WHERE id=$15 AND tenant_id=$16`,
-    [b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,fileName,filePath,req.params.id,tenant.id]);
+  const b=req.body; let fileName=current.source_file_name,filePath=current.source_file_path,fileMime=current.source_mime_type;
+  if(req.file){if(filePath){try{fs.unlinkSync(filePath);}catch(_){}} fileName=req.file.originalname;filePath=req.file.path;fileMime=req.file.mimetype;}
+  await pool.query(`UPDATE expense_records SET supplier_name=$1,supplier_tax_id=$2,document_number=$3,expense_date=$4,category=$5,description=$6,net_minor=$7,tax_minor=$8,total_minor=$9,tax_rate=$10,payment_method=$11,notes=$12,source_file_name=$13,source_file_path=$14,source_mime_type=$15,updated_at=now() WHERE id=$16 AND tenant_id=$17`,
+    [b.supplier_name||null,b.supplier_tax_id||null,b.document_number||null,b.expense_date||null,b.category||null,b.description||null,minor(b.net_amount),minor(b.tax_amount),minor(b.total_amount),b.tax_rate===''?null:Number(b.tax_rate||0),b.payment_method||null,b.notes||null,fileName,filePath,fileMime,req.params.id,tenant.id]);
   res.redirect('/expenses');
 });
 
@@ -2506,7 +2822,10 @@ async function initialiseDatabase() {
   await pool.query(`
     ALTER TABLE expense_records
       ADD COLUMN IF NOT EXISTS source_drive_file_id TEXT,
-      ADD COLUMN IF NOT EXISTS source_mime_type TEXT;
+      ADD COLUMN IF NOT EXISTS source_mime_type TEXT,
+      ADD COLUMN IF NOT EXISTS extraction_confidence NUMERIC(5,4),
+      ADD COLUMN IF NOT EXISTS extraction_notes TEXT,
+      ADD COLUMN IF NOT EXISTS extracted_at TIMESTAMPTZ;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_drive_file_unique
       ON expense_records(tenant_id, source_drive_file_id)
       WHERE source_drive_file_id IS NOT NULL;
