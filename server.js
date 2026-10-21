@@ -7,6 +7,7 @@ const nodemailer = require('nodemailer');
 const archiver = require('archiver');
 const multer = require('multer');
 const { google } = require('googleapis');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('./db');
@@ -31,31 +32,74 @@ function driveFolderId() {
   return String(process.env.EXPENSES_DRIVE_FOLDER_ID || DEFAULT_EXPENSES_DRIVE_FOLDER_ID).trim();
 }
 
-function googleCredentials() {
-  const raw = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
-  if (!raw) throw new Error('Google Drive is not configured yet. Add GOOGLE_SERVICE_ACCOUNT_JSON in Render.');
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.');
+function googleOAuthConfigured() {
+  return !!(
+    String(process.env.GOOGLE_CLIENT_ID||'').trim() &&
+    String(process.env.GOOGLE_CLIENT_SECRET||'').trim() &&
+    String(process.env.GOOGLE_REDIRECT_URI||'').trim()
+  );
+}
+
+function googleOAuthClient() {
+  if(!googleOAuthConfigured()){
+    throw new Error('Google OAuth is not configured in Render yet.');
   }
+  return new google.auth.OAuth2(
+    String(process.env.GOOGLE_CLIENT_ID).trim(),
+    String(process.env.GOOGLE_CLIENT_SECRET).trim(),
+    String(process.env.GOOGLE_REDIRECT_URI).trim()
+  );
 }
 
-function driveClient() {
-  const credentials = googleCredentials();
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive.readonly']
+function googleTokenKey() {
+  const raw=String(process.env.GOOGLE_TOKEN_ENCRYPTION_KEY||'').trim();
+  if(!raw) throw new Error('GOOGLE_TOKEN_ENCRYPTION_KEY is missing in Render.');
+  return crypto.createHash('sha256').update(raw,'utf8').digest();
+}
+
+function encryptGoogleToken(value) {
+  const iv=crypto.randomBytes(12);
+  const cipher=crypto.createCipheriv('aes-256-gcm',googleTokenKey(),iv);
+  const encrypted=Buffer.concat([cipher.update(String(value),'utf8'),cipher.final()]);
+  const tag=cipher.getAuthTag();
+  return [iv.toString('base64url'),tag.toString('base64url'),encrypted.toString('base64url')].join('.');
+}
+
+function decryptGoogleToken(payload) {
+  const parts=String(payload||'').split('.');
+  if(parts.length!==3) throw new Error('Stored Google Drive token is invalid.');
+  const iv=Buffer.from(parts[0],'base64url');
+  const tag=Buffer.from(parts[1],'base64url');
+  const encrypted=Buffer.from(parts[2],'base64url');
+  const decipher=crypto.createDecipheriv('aes-256-gcm',googleTokenKey(),iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted),decipher.final()]).toString('utf8');
+}
+
+async function driveConnection(tenantId) {
+  return (await pool.query(`
+    SELECT google_drive_refresh_token_enc,google_drive_connected_at
+    FROM invoice_tenants WHERE id=$1
+  `,[tenantId])).rows[0] || null;
+}
+
+async function driveClient(tenantId) {
+  const connection=await driveConnection(tenantId);
+  if(!connection?.google_drive_refresh_token_enc){
+    throw new Error('Google Drive is not connected. Click Connect Google Drive first.');
+  }
+  const auth=googleOAuthClient();
+  auth.setCredentials({
+    refresh_token: decryptGoogleToken(connection.google_drive_refresh_token_enc)
   });
-  return google.drive({ version: 'v3', auth });
+  return google.drive({version:'v3',auth});
 }
-
 function isSupportedExpenseMime(mime) {
   return ['application/pdf','image/jpeg','image/png','image/webp'].includes(String(mime||''));
 }
 
-async function listExpenseDriveFiles() {
-  const drive = driveClient();
+async function listExpenseDriveFiles(tenantId) {
+  const drive = await driveClient(tenantId);
   const folderId = driveFolderId();
   const files = [];
   let pageToken = null;
@@ -75,8 +119,8 @@ async function listExpenseDriveFiles() {
   return files.filter(f => isSupportedExpenseMime(f.mimeType));
 }
 
-async function downloadDriveFileBuffer(fileId) {
-  const drive = driveClient();
+async function downloadDriveFileBuffer(fileId, tenantId) {
+  const drive = await driveClient(tenantId);
   const r = await drive.files.get(
     { fileId, alt: 'media', supportsAllDrives: true },
     { responseType: 'arraybuffer' }
@@ -507,6 +551,65 @@ app.post('/login',(req,res)=>{
 app.get('/logout',(req,res)=>req.session.destroy(()=>res.redirect('/login')));
 app.use(requireAuth);
 
+app.get('/google/connect',async(req,res)=>{
+  try{
+    if(!googleOAuthConfigured())throw new Error('Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI in Render first.');
+    const state=crypto.randomBytes(24).toString('hex');
+    req.session.googleOAuthState=state;
+    const auth=googleOAuthClient();
+    const url=auth.generateAuthUrl({
+      access_type:'offline',
+      prompt:'consent',
+      state,
+      scope:['https://www.googleapis.com/auth/drive.readonly']
+    });
+    res.redirect(url);
+  }catch(err){
+    res.status(400).send(shell('Google Drive connection','expenses',`<section class="card"><h2>Could not start Google Drive connection</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/expenses">Back</a></section>`));
+  }
+});
+
+app.get('/google/callback',async(req,res)=>{
+  try{
+    const state=String(req.query.state||'');
+    const expected=String(req.session.googleOAuthState||'');
+    delete req.session.googleOAuthState;
+    if(!state || !expected || state!==expected)throw new Error('Google connection state did not match. Please try connecting again.');
+    if(req.query.error)throw new Error(`Google did not grant access: ${req.query.error}`);
+
+    const code=String(req.query.code||'');
+    if(!code)throw new Error('Google did not return an authorisation code.');
+
+    const auth=googleOAuthClient();
+    const {tokens}=await auth.getToken(code);
+    if(!tokens.refresh_token){
+      throw new Error('Google did not return an offline refresh token. Disconnect the app in your Google Account permissions, then connect again.');
+    }
+
+    const tenant=await getTenant();
+    await pool.query(`
+      UPDATE invoice_tenants
+      SET google_drive_refresh_token_enc=$1,google_drive_connected_at=now(),updated_at=now()
+      WHERE id=$2
+    `,[encryptGoogleToken(tokens.refresh_token),tenant.id]);
+
+    res.redirect('/expenses?sync='+encodeURIComponent('Google Drive connected successfully. You can now sync the Expenses Inbox.'));
+  }catch(err){
+    console.error('Google OAuth callback failed:',err);
+    res.status(400).send(shell('Google Drive connection error','expenses',`<section class="card"><h2>Could not connect Google Drive</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/expenses">Back to expenses</a></section>`));
+  }
+});
+
+app.post('/google/disconnect',async(req,res)=>{
+  const tenant=await getTenant();
+  await pool.query(`
+    UPDATE invoice_tenants
+    SET google_drive_refresh_token_enc=NULL,google_drive_connected_at=NULL,updated_at=now()
+    WHERE id=$1
+  `,[tenant.id]);
+  res.redirect('/expenses?sync='+encodeURIComponent('Google Drive disconnected.'));
+});
+
 app.get('/', async (req,res)=>{
   const tenant=await getTenant();
   const [counts,total,paid,outstanding,recent]=await Promise.all([
@@ -810,7 +913,9 @@ app.get('/expenses',async(req,res)=>{
   }
   const rows=(await pool.query(`SELECT * FROM expense_records WHERE ${where} ORDER BY COALESCE(expense_date,created_at::date) DESC,created_at DESC`,params)).rows;
 
-  const driveConfigured=!!String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON||'').trim();
+  const driveConfigured=googleOAuthConfigured();
+  const driveConnectionRow=await driveConnection(tenant.id);
+  const driveConnected=!!driveConnectionRow?.google_drive_refresh_token_enc;
   const needsDetails=rows.filter(r=>r.extraction_status==='check_details').length;
 
   const table=rows.length?`<div class="table-wrap"><table>
@@ -833,7 +938,8 @@ app.get('/expenses',async(req,res)=>{
     <div class="actions" style="justify-content:space-between;margin-bottom:14px">
       <div><h2 style="margin:0">Expenses</h2><p class="sub" style="margin:4px 0 0">Receipts and supplier invoices feeding the Gestor pack.</p></div>
       <div class="actions">
-        <form method="post" action="/expenses/drive-sync"><button class="btn ${driveConfigured?'gold':'light'}" ${driveConfigured?'':'disabled'}>Sync Google Drive</button></form>
+        ${driveConnected?`<form method="post" action="/expenses/drive-sync"><button class="btn gold">Sync Google Drive</button></form>`:`<a class="btn gold" href="/google/connect">Connect Google Drive</a>`}
+        ${driveConnected?`<form method="post" action="/google/disconnect" onsubmit="return confirm('Disconnect Google Drive from Sotoboats?');"><button class="btn light">Disconnect Drive</button></form>`:''}
         <a class="btn light" href="/expenses/new">Add manually</a>
       </div>
     </div>
@@ -847,7 +953,7 @@ app.get('/expenses',async(req,res)=>{
   <section class="card">
     <h2>Google Drive intake</h2>
     <p class="sub">Folder: <strong>Sotoboats → Accounts → Expenses Inbox</strong></p>
-    <p class="sub">${driveConfigured?'Drive access is configured. Sync imports only new PDF/JPG/PNG/WEBP files and will not duplicate files already seen.':'One Render credential is still required before the app itself can read Drive. See the V17 setup instructions.'}</p>
+    <p class="sub">${!driveConfigured?'Google OAuth environment variables are still required in Render.':driveConnected?'Google Drive is connected. Sync imports only new PDF/JPG/PNG/WEBP files and will not duplicate files already seen.':'OAuth is configured. Click Connect Google Drive once to authorise access.'}</p>
   </section>`;
   res.send(shell('Expenses','expenses',content,'Supplier bills, receipts and supporting documents.'));
 });
@@ -855,7 +961,7 @@ app.get('/expenses',async(req,res)=>{
 app.post('/expenses/drive-sync',async(req,res)=>{
   try{
     const tenant=await getTenant();
-    const files=await listExpenseDriveFiles();
+    const files=await listExpenseDriveFiles(tenant.id);
     let imported=0,existing=0;
 
     for(const f of files){
@@ -2233,7 +2339,7 @@ app.get('/month-end/gestor-pack.zip',async(req,res)=>{
 
       if(e.source_type==='google_drive' && e.source_drive_file_id){
         try{
-          const buf=await downloadDriveFileBuffer(e.source_drive_file_id);
+          const buf=await downloadDriveFileBuffer(e.source_drive_file_id,tenant.id);
           archive.append(buf,{name:zipName});
         }catch(err){
           console.error(`Could not add Drive expense ${e.source_drive_file_id} to Gestor pack:`,err.message);
@@ -2302,7 +2408,9 @@ async function initialiseDatabase() {
     ALTER TABLE invoice_tenants
       ADD COLUMN IF NOT EXISTS credit_note_prefix TEXT NOT NULL DEFAULT 'CN-',
       ADD COLUMN IF NOT EXISTS credit_note_padding INTEGER NOT NULL DEFAULT 6,
-      ADD COLUMN IF NOT EXISTS next_credit_note_number INTEGER NOT NULL DEFAULT 1;
+      ADD COLUMN IF NOT EXISTS next_credit_note_number INTEGER NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS google_drive_refresh_token_enc TEXT,
+      ADD COLUMN IF NOT EXISTS google_drive_connected_at TIMESTAMPTZ;
   `);
 
   await pool.query(`
