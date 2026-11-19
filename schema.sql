@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS customer_invoices (
   payment_mode text NOT NULL DEFAULT 'auto' CHECK (payment_mode IN ('auto','full','deposit','custom')),
   bank_transfer_enabled boolean NOT NULL DEFAULT true,
   online_payments_enabled boolean NOT NULL DEFAULT false,
+  wise_payment_url text,
+  wise_payment_amount_minor bigint,
+  wise_payment_public_token text,
+  wise_payment_updated_at timestamptz,
   issued_at timestamptz,
   locked_at timestamptz,
   original_invoice_id uuid REFERENCES customer_invoices(id),
@@ -97,6 +101,9 @@ CREATE TABLE IF NOT EXISTS customer_invoices (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_invoice_number_unique
   ON customer_invoices(tenant_id, invoice_number) WHERE invoice_number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_customer_invoices_tenant_status ON customer_invoices(tenant_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_invoice_wise_token_unique
+  ON customer_invoices(wise_payment_public_token)
+  WHERE wise_payment_public_token IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS customer_invoice_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -121,7 +128,7 @@ CREATE TABLE IF NOT EXISTS customer_invoice_payments (
   invoice_id uuid NOT NULL REFERENCES customer_invoices(id),
   amount_minor bigint NOT NULL CHECK (amount_minor > 0),
   currency_code char(3) NOT NULL DEFAULT 'EUR',
-  method text NOT NULL CHECK (method IN ('bank_transfer','cash','card_external','stripe','other')),
+  method text NOT NULL CHECK (method IN ('bank_transfer','cash','card_external','stripe','wise','other')),
   reference text,
   status text NOT NULL DEFAULT 'succeeded' CHECK (status IN ('pending','succeeded','failed','refunded','part_refunded')),
   paid_at timestamptz,
