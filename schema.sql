@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS invoice_tenants (
   bank_name text,
   bank_iban text,
   bank_bic text,
+  bank_address text,
   english_footer text,
   spanish_footer text,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -147,19 +148,46 @@ CREATE TABLE IF NOT EXISTS customer_invoice_events (
 );
 CREATE INDEX IF NOT EXISTS idx_customer_invoice_events_invoice ON customer_invoice_events(invoice_id, created_at);
 
+CREATE TABLE IF NOT EXISTS payment_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
+  request_number bigserial UNIQUE,
+  invoice_id uuid REFERENCES customer_invoices(id) ON DELETE SET NULL,
+  customer_name text NOT NULL,
+  customer_phone text,
+  customer_email text,
+  purpose text NOT NULL,
+  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+  currency_code char(3) NOT NULL DEFAULT 'EUR',
+  status text NOT NULL DEFAULT 'awaiting' CHECK (status IN ('awaiting','paid','cancelled')),
+  public_token text NOT NULL UNIQUE,
+  created_by text,
+  shared_at timestamptz,
+  share_count integer NOT NULL DEFAULT 0,
+  last_shared_channel text,
+  paid_at timestamptz,
+  paid_reference text,
+  invoice_payment_id uuid REFERENCES customer_invoice_payments(id) ON DELETE SET NULL,
+  cancelled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_payment_requests_tenant_status ON payment_requests(tenant_id,status,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice ON payment_requests(invoice_id,created_at DESC);
+
 INSERT INTO invoice_tenants (
   code, trading_name, legal_name, tax_id, country_code, currency_code,
   address_1, postcode, city, region, country_name, email, phone,
   invoice_prefix, invoice_padding, next_invoice_number, payment_terms_days,
   default_language, deposit_percent, deposit_threshold_days,
-  bank_account_name, bank_name, bank_iban, bank_bic,
+  bank_account_name, bank_name, bank_iban, bank_bic, bank_address,
   english_footer, spanish_footer
 )
 VALUES (
   'SOTOBOATS', 'Sotoboats', 'Marbella Sailing School S.L.', 'ESB93733012', 'ES', 'EUR',
   'Edificio Levante 24b', '29680', 'Estepona', 'Andalucía', 'Spain', 'info@sailandpower.es', '+34 621 089 785',
   '', 7, 1575, 5, 'bilingual', 25.0000, 30,
-  'Marbella Sailing School S.L.', 'CaixaBank', 'ES0621006848150200185240', 'CAIXESBBXXX',
+  'David Barry Knowles Knowles', 'Wise', 'BE89 9052 7577 8885', 'TRWIBEB1XXX', 'Wise, Rue du Trône 100, 3rd floor, Brussels, 1050, Belgium',
   'Thank you for choosing Sotoboats, trading as Marbella Sailing School S.L. Payment is due within 5 days of receipt. Bookings made within 30 days of the service start date require full payment. Bookings made more than 30 days in advance require a 25% deposit, with the balance due 30 days before arrival.',
   'Gracias por elegir Sotoboats, nombre comercial de Marbella Sailing School S.L. El pago vence dentro de los 5 días posteriores a la recepción. Las reservas realizadas dentro de los 30 días anteriores a la fecha de inicio requieren el pago total. Para reservas realizadas con más de 30 días de antelación, se requiere un depósito del 25%, con el saldo pendiente 30 días antes de la llegada.'
 )
