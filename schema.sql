@@ -168,12 +168,20 @@ CREATE TABLE IF NOT EXISTS payment_requests (
   paid_at timestamptz,
   paid_reference text,
   invoice_payment_id uuid REFERENCES customer_invoice_payments(id) ON DELETE SET NULL,
+  stripe_payment_intent_id text,
+  stripe_payment_status text,
+  stripe_charge_id text,
+  stripe_payment_method text,
+  stripe_paid_at timestamptz,
   cancelled_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_payment_requests_tenant_status ON payment_requests(tenant_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice ON payment_requests(invoice_id,created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
+  ON payment_requests(stripe_payment_intent_id)
+  WHERE stripe_payment_intent_id IS NOT NULL;
 
 INSERT INTO invoice_tenants (
   code, trading_name, legal_name, tax_id, country_code, currency_code,
