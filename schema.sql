@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS invoice_tenants (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Migration safety for existing Sotoboats databases created before bank_address existed.
+ALTER TABLE invoice_tenants
+  ADD COLUMN IF NOT EXISTS bank_address text;
+
 CREATE TABLE IF NOT EXISTS invoice_customers (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
@@ -177,6 +181,16 @@ CREATE TABLE IF NOT EXISTS payment_requests (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Migration safety for an existing Payment Requests table created before Stripe support.
+-- The ALTER must happen before creating an index that references the new Stripe column.
+ALTER TABLE payment_requests
+  ADD COLUMN IF NOT EXISTS stripe_payment_intent_id text,
+  ADD COLUMN IF NOT EXISTS stripe_payment_status text,
+  ADD COLUMN IF NOT EXISTS stripe_charge_id text,
+  ADD COLUMN IF NOT EXISTS stripe_payment_method text,
+  ADD COLUMN IF NOT EXISTS stripe_paid_at timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_payment_requests_tenant_status ON payment_requests(tenant_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice ON payment_requests(invoice_id,created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
