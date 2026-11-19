@@ -430,6 +430,34 @@ const fmtDate = (v) => {
 
 const iso = (v) => dateYmd(v);
 
+function publicAppBaseUrl(req=null) {
+  if(req && req.get){
+    const host=String(req.get('host')||'').trim();
+    if(host) return `${req.protocol}://${host}`.replace(/\/+$/,'');
+  }
+  return String(
+    process.env.PUBLIC_BASE_URL
+    || process.env.RENDER_EXTERNAL_URL
+    || 'https://sotoboats-invoicing.onrender.com'
+  ).trim().replace(/\/+$/,'');
+}
+
+function customerPaymentPageUrl(invoice, req=null) {
+  const token=String(invoice?.wise_payment_public_token||'').trim();
+  if(!token) return '';
+  return `${publicAppBaseUrl(req)}/pay/${encodeURIComponent(token)}`;
+}
+
+function paymentAmountForInvoice(invoice) {
+  const outstanding=Math.max(0,Number(invoice?.outstanding_minor||0));
+  if(outstanding<=0) return 0;
+  const saved=Number(invoice?.wise_payment_amount_minor||0);
+  if(saved>0) return saved;
+  const dueNow=Number(invoice?.amount_due_now_minor||0);
+  if(dueNow>0) return Math.min(dueNow,outstanding);
+  return outstanding;
+}
+
 async function getTenant(client = pool) {
   const { rows } = await client.query(`SELECT * FROM invoice_tenants WHERE code='SOTOBOATS' LIMIT 1`);
   if (!rows[0]) throw new Error('Sotoboats tenant is missing. Database startup initialisation did not complete.');
@@ -447,7 +475,6 @@ async function refreshOverdueStatuses(tenantId) {
       AND due_date < CURRENT_DATE
       AND status NOT IN ('paid','cancelled','credited','overdue')
   `,[tenantId]);
-
   await pool.query(`
     UPDATE customer_invoices
     SET status=CASE WHEN paid_minor > 0 THEN 'part_paid' ELSE 'sent' END, updated_at=now()
@@ -998,6 +1025,92 @@ app.get('/gestor/pack.zip',requireGestorAuth,async(req,res)=>{
   }
 });
 
+app.get('/pay/:token',async(req,res)=>{
+  try{
+    const token=String(req.params.token||'').trim();
+    if(!token || token.length<20) return res.status(404).send('Payment page not found.');
+
+    const i=(await pool.query(`
+      SELECT i.*,
+             t.trading_name,t.legal_name,t.email AS business_email,t.phone AS business_phone
+      FROM customer_invoices i
+      JOIN invoice_tenants t ON t.id=i.tenant_id
+      WHERE i.wise_payment_public_token=$1
+        AND i.locked_at IS NOT NULL
+      LIMIT 1
+    `,[token])).rows[0];
+
+    if(!i) return res.status(404).send('Payment page not found.');
+
+    const outstanding=Math.max(0,Number(i.outstanding_minor||0));
+    const requested=Math.max(0,Number(i.wise_payment_amount_minor||0));
+    const link=String(i.wise_payment_url||'').trim();
+    const requestTooHigh=requested>outstanding && outstanding>0;
+    const ready=!!(link && requested>0 && outstanding>0 && !requestTooHigh);
+    const remainingAfter=ready?Math.max(0,outstanding-requested):outstanding;
+
+    const statusContent=outstanding<=0
+      ? `<div class="status paid"><strong>Paid</strong><span>There is no outstanding balance on this invoice.</span></div>`
+      : requestTooHigh
+        ? `<div class="status warn"><strong>Payment request needs updating</strong><span>The invoice balance has changed since this Wise request was created. Please contact Sotoboats before paying.</span></div>`
+        : !ready
+          ? `<div class="status warn"><strong>Payment link not available</strong><span>Please contact Sotoboats and we will send you an updated payment request.</span></div>`
+          : `<a class="pay-btn" href="${esc(link)}" rel="noopener noreferrer">Continue to secure payment</a>
+             <p class="wise-note">Payment is completed securely through Wise. Wise may display the verified recipient name associated with the receiving account.</p>`;
+
+    res.send(`<!doctype html><html><head>
+      <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="theme-color" content="#0b1d2f">
+      <title>Sotoboats Payment ${esc(i.invoice_number||'')}</title>
+      <style>
+        *{box-sizing:border-box}
+        body{margin:0;background:#f3f6f7;color:#0b1d2f;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .wrap{width:min(100%,620px);margin:auto;padding:28px 16px 46px}
+        .brand{text-align:center;margin-bottom:18px}
+        .brand img{width:230px;max-width:72%;height:auto}
+        .card{overflow:hidden;border:1px solid #dce3e6;border-radius:20px;background:#fff;box-shadow:0 18px 50px rgba(11,29,47,.09)}
+        .head{padding:24px 25px;background:#0b1d2f;color:#fff}
+        .eyebrow{color:#caa86d;font-size:11px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
+        h1{margin:7px 0 0;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:600}
+        .body{padding:25px}.sub{margin:0 0 20px;color:#667783;font-size:13px;line-height:1.6}
+        .details{display:grid;gap:1px;margin:0 0 20px;border:1px solid #e0e6e9;border-radius:13px;overflow:hidden;background:#e0e6e9}
+        .row{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:13px 14px;background:#fff}
+        .row span{color:#70818b;font-size:11px}.row strong{font-size:13px;text-align:right}
+        .amount{margin:20px 0;padding:20px;border-radius:14px;background:#f6f1e8;text-align:center}
+        .amount span{display:block;color:#796747;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+        .amount strong{display:block;margin-top:5px;font-size:34px;font-family:Georgia,"Times New Roman",serif}
+        .amount small{display:block;margin-top:6px;color:#796747}
+        .pay-btn{display:flex;min-height:55px;align-items:center;justify-content:center;border-radius:12px;background:#caa86d;color:#0b1d2f;font-size:15px;font-weight:900;text-decoration:none}
+        .wise-note{margin:13px 5px 0;color:#7a898f;font-size:10px;line-height:1.55;text-align:center}
+        .status{padding:18px;border-radius:12px}.status strong,.status span{display:block}.status strong{font-size:15px}.status span{margin-top:6px;font-size:12px;line-height:1.5}
+        .status.paid{background:#edf8f1;color:#236642}.status.warn{background:#fff6df;color:#7b5a11}
+        .footer{padding:16px 25px;border-top:1px solid #e1e7ea;background:#fafcfc;color:#7b8a91;font-size:10px;line-height:1.5;text-align:center}
+        @media(max-width:520px){.wrap{padding:14px 9px 30px}.head,.body{padding:20px}.row{align-items:flex-start;flex-direction:column;gap:4px}.row strong{text-align:left}}
+      </style></head><body><main class="wrap">
+        <div class="brand"><img src="/sotoboats-logo.png" alt="Sotoboats"></div>
+        <section class="card">
+          <header class="head"><div class="eyebrow">Secure payment request</div><h1>Invoice ${esc(i.invoice_number||'')}</h1></header>
+          <div class="body">
+            <p class="sub">Please check the details below before continuing to Wise to complete your payment.</p>
+            <div class="details">
+              <div class="row"><span>Invoice reference</span><strong>${esc(i.invoice_number||'')}</strong></div>
+              ${i.booking_reference?`<div class="row"><span>Booking reference</span><strong>${esc(i.booking_reference)}</strong></div>`:''}
+              ${i.service_title?`<div class="row"><span>For</span><strong>${esc(i.service_title)}</strong></div>`:''}
+              <div class="row"><span>Due date</span><strong>${fmtDate(i.due_date)}</strong></div>
+              <div class="row"><span>Invoice balance</span><strong>${euro(outstanding)}</strong></div>
+            </div>
+            ${outstanding>0?`<div class="amount"><span>${ready?'Amount requested now':'Outstanding balance'}</span><strong>${euro(ready?requested:outstanding)}</strong>${ready&&remainingAfter>0?`<small>Remaining invoice balance after this payment: ${euro(remainingAfter)}</small>`:''}</div>`:''}
+            ${statusContent}
+          </div>
+          <footer class="footer">${esc(i.trading_name||'Sotoboats')} is a trading name of ${esc(i.legal_name||'Marbella Sailing School S.L.')}<br>${esc(i.business_email||'')}${i.business_phone?` · ${esc(i.business_phone)}`:''}</footer>
+        </section>
+      </main></body></html>`);
+  }catch(err){
+    console.error('Public payment page failed:',err);
+    res.status(500).send('This payment page is temporarily unavailable. Please contact Sotoboats.');
+  }
+});
+
 app.use(requireAuth);
 
 app.get('/google/connect',async(req,res)=>{
@@ -1228,7 +1341,7 @@ app.get('/customers/import',async(req,res)=>{
     }
     function norm(v){return String(v||'').trim().toLowerCase().replace(/[_-]+/g,' ').replace(/\\s+/g,' ');}
     function renderMapping(){
-      const html='<h3>Map columns</h3><div class="table-wrap"><table><thead><tr><th>CSV column</th><th>Import as</th><th>Example</th></tr></thead><tbody>'+
+      const html='<h3>Map columns</h3><div class="table-wrap"><table><thead><tr><th>CSV column</th><th>Import as</th><th>Example</th></tr></thead><tbody>'+ 
       headers.map((h,i)=>{
         const guess=aliases[norm(h)]||'';
         return '<tr><td><strong>'+escapeHtml(h)+'</strong></td><td><select class="mapSelect" data-index="'+i+'">'+
@@ -1255,8 +1368,8 @@ app.get('/customers/import',async(req,res)=>{
     function renderPreview(){
       const rows=mappedRows();
       const first=rows.slice(0,8);
-      document.getElementById('previewArea').innerHTML='<h3>Preview</h3><p class="sub">'+rows.length+' row(s) ready to import.</p>'+
-        (first.length?'<div class="table-wrap"><table><thead><tr><th>Name</th><th>Company</th><th>Email</th><th>Phone</th><th>City</th></tr></thead><tbody>'+
+      document.getElementById('previewArea').innerHTML='<h3>Preview</h3><p class="sub">'+rows.length+' row(s) ready to import.</p>'+ 
+        (first.length?'<div class="table-wrap"><table><thead><tr><th>Name</th><th>Company</th><th>Email</th><th>Phone</th><th>City</th></tr></thead><tbody>'+ 
         first.map(r=>'<tr><td>'+escapeHtml(r.contact_name||'')+'</td><td>'+escapeHtml(r.company_name||'')+'</td><td>'+escapeHtml(r.email||'')+'</td><td>'+escapeHtml(r.phone||'')+'</td><td>'+escapeHtml(r.billing_city||'')+'</td></tr>').join('')+
         '</tbody></table></div>':'');
       document.getElementById('importBtn').disabled=!rows.length;
@@ -1347,7 +1460,6 @@ app.post('/customers/import',async(req,res)=>{
   }
   res.json({ok:true,imported,updated,skipped,errors});
 });
-
 
 app.get('/expenses',async(req,res)=>{
   const tenant=await getTenant();
@@ -1648,15 +1760,15 @@ app.get('/invoices',async(req,res)=>{
 
 function lineRowsHtml(items=[]) {
   const rows=items.length?items:[{description_en:'',description_es:'',detail_en:'',detail_es:'',quantity:1,unit_price_minor:0,tax_rate:21}];
-  const presetOptions='<option value="">Choose a description…</option>'+
-    '<option value="tuition">Private sailing tuition</option>'+
-    '<option value="sunseeker">Charter – Sunseeker</option>'+
-    '<option value="catamaran">Charter – Catamaran</option>'+
-    '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+
-    '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+
-    '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+
-    '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+
-    '<option value="delivery">Boat delivery</option>'+
+  const presetOptions='<option value="">Choose a description…</option>'+ 
+    '<option value="tuition">Private sailing tuition</option>'+ 
+    '<option value="sunseeker">Charter – Sunseeker</option>'+ 
+    '<option value="catamaran">Charter – Catamaran</option>'+ 
+    '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+ 
+    '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+ 
+    '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+ 
+    '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+ 
+    '<option value="delivery">Boat delivery</option>'+ 
     '<option value="custom">Other / Custom description</option>';
   return rows.map((i)=>`<div class="line-grid line-row">
     <div class="preset-bar">
@@ -1754,26 +1866,26 @@ async function invoiceForm(res, invoice=null, items=[]) {
     d.innerHTML=
       '<div class="preset-bar">'+
         '<label>Description template<select class="description-preset">'+
-          '<option value="">Choose a description…</option>'+
-          '<option value="tuition">Private sailing tuition</option>'+
-          '<option value="sunseeker">Charter – Sunseeker</option>'+
-          '<option value="catamaran">Charter – Catamaran</option>'+
-          '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+
-          '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+
-          '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+
-          '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+
-          '<option value="delivery">Boat delivery</option>'+
-          '<option value="custom">Other / Custom description</option>'+
-        '</select></label>'+
-        '<label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="4"></label>'+
-        '<label class="from-wrap">From<input class="preset-from" placeholder="Estepona"></label>'+
-        '<label class="to-wrap">To<input class="preset-to" placeholder="Ibiza"></label>'+
-      '</div>'+
-      '<div><label>English description<input class="desc-en" name="description_en" required></label><label style="margin-top:6px">English detail<input name="detail_en"></label></div>'+
-      '<div><label>Spanish description<input class="desc-es" name="description_es"></label><label style="margin-top:6px">Spanish detail<input name="detail_es"></label></div>'+
-      '<label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="1" required></label>'+
-      '<label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="0.00" required></label>'+
-      '<label>VAT<select name="tax_rate"><option value="0">0%</option><option value="10">10%</option><option value="21" selected>21%</option></select></label>'+
+          '<option value="">Choose a description…</option>'+ 
+          '<option value="tuition">Private sailing tuition</option>'+ 
+          '<option value="sunseeker">Charter – Sunseeker</option>'+ 
+          '<option value="catamaran">Charter – Catamaran</option>'+ 
+          '<option value="jeanneau">Charter – Jeanneau sail boat</option>'+ 
+          '<option value="morocco_tuition">Morocco sailing trip – Sailing tuition</option>'+ 
+          '<option value="morocco_subsistence">Morocco sailing trip – Subsistence / cleaning / onboard facilities</option>'+ 
+          '<option value="subsistence">Subsistence / cleaning / onboard facilities</option>'+ 
+          '<option value="delivery">Boat delivery</option>'+ 
+          '<option value="custom">Other / Custom description</option>'+ 
+        '</select></label>'+ 
+        '<label class="hours-wrap">Hours<input class="preset-hours" type="number" min="0.5" step="0.5" placeholder="4"></label>'+ 
+        '<label class="from-wrap">From<input class="preset-from" placeholder="Estepona"></label>'+ 
+        '<label class="to-wrap">To<input class="preset-to" placeholder="Ibiza"></label>'+ 
+      '</div>'+ 
+      '<div><label>English description<input class="desc-en" name="description_en" required></label><label style="margin-top:6px">English detail<input name="detail_en"></label></div>'+ 
+      '<div><label>Spanish description<input class="desc-es" name="description_es"></label><label style="margin-top:6px">Spanish detail<input name="detail_es"></label></div>'+ 
+      '<label>Qty<input type="number" min="0.001" step="0.001" name="quantity" value="1" required></label>'+ 
+      '<label>Net unit €<input type="number" min="0" step="0.01" name="unit_price" value="0.00" required></label>'+ 
+      '<label>VAT<select name="tax_rate"><option value="0">0%</option><option value="10">10%</option><option value="21" selected>21%</option></select></label>'+ 
       '<button class="remove" type="button">×</button>';
     wrap.appendChild(d);
     wireLineRow(d);
@@ -1913,6 +2025,10 @@ function invoiceEmailHtml(data) {
   const due = fmtDate(i.due_date);
   const name = esc(i.contact_name || i.company_name || 'Customer');
   const invoiceNo = esc(i.invoice_number || '');
+  const paymentUrl = i.wise_payment_url ? customerPaymentPageUrl(i) : '';
+  const paymentBlock = paymentUrl && Number(i.outstanding_minor)>0
+    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">Pay securely</a></p><p style="font-size:12px;color:#72838d">You will see the Sotoboats payment page first, then continue securely to Wise.</p>`
+    : '<p>Payment details are included on the attached invoice.</p>';
   return `<!doctype html>
   <html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
     <div style="max-width:650px;margin:0 auto;padding:28px 16px">
@@ -1928,7 +2044,7 @@ function invoiceEmailHtml(data) {
           <div style="font-size:28px;font-weight:700;color:#0b1d2f;margin-top:3px">${balance}</div>
           <div style="font-size:12px;color:#72838d;margin-top:5px">Due ${due}</div>
         </div>
-        <p>Payment details are included on the attached invoice.</p>
+        ${paymentBlock}
         <p style="margin-bottom:0">Thank you,<br><strong>Sotoboats</strong></p>
       </div>
       <div style="text-align:center;color:#8998a0;font-size:11px;padding:16px">
@@ -1943,6 +2059,10 @@ function paymentReminderHtml(data) {
   const {tenant,invoice:i}=data;
   const overdue=i.due_date && dateYmd(i.due_date) < new Date().toISOString().slice(0,10);
   const name=esc(i.contact_name||i.company_name||'Customer');
+  const paymentUrl=i.wise_payment_url?customerPaymentPageUrl(i):'';
+  const paymentBlock=paymentUrl&&Number(i.outstanding_minor)>0
+    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">Pay securely</a></p><p style="font-size:12px;color:#72838d">You will see the Sotoboats payment page first, then continue securely to Wise.</p>`
+    : '<p>If payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.</p>';
   return `<!doctype html><html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
   <div style="max-width:650px;margin:0 auto;padding:28px 16px">
     <div style="background:#0b1d2f;padding:22px;border-radius:14px 14px 0 0">
@@ -1957,7 +2077,8 @@ function paymentReminderHtml(data) {
         <div style="font-size:28px;font-weight:700;color:#0b1d2f;margin-top:3px">${euro(i.outstanding_minor)}</div>
         <div style="font-size:12px;color:#72838d;margin-top:5px">${overdue?'Was due':'Due'} ${fmtDate(i.due_date)}</div>
       </div>
-      <p>If payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.</p>
+      <p>If payment has already been made, please disregard this message.</p>
+      ${paymentBlock}
       <p style="margin-bottom:0">Many thanks,<br><strong>Sotoboats</strong></p>
     </div>
     <div style="text-align:center;color:#8998a0;font-size:11px;padding:16px">${esc(tenant.legal_name)} · ${esc(tenant.email||'')}</div>
@@ -2098,15 +2219,32 @@ app.get('/invoices/:id',async(req,res)=>{
   const reminderBtn=i.locked_at&&i.email&&Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/remind" onsubmit="return confirm('Send a friendly payment reminder to ${esc(i.email)}?');"><button class="btn light">Send reminder</button></form>`:'';
   const creditBtn=i.locked_at&&remainingCredit>0?`<a class="btn light" href="/invoices/${i.id}/credit-note">Create credit note</a>`:'';
 
+  const customerPayUrl=i.wise_payment_url?customerPaymentPageUrl(i,req):'';
+  const suggestedWiseAmount=Math.min(
+    Number(i.outstanding_minor||0),
+    Math.max(0,Number(i.wise_payment_amount_minor||i.amount_due_now_minor||i.outstanding_minor||0))
+  );
+  const wisePayment=i.locked_at?`<section class="card no-print">
+    <div class="section-head"><div><h2>Wise payment request</h2><p class="sub">Create the payment request in Dave's approved Wise account, then paste the Wise link here. The customer receives a Sotoboats-branded page first.</p></div></div>
+    ${Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/wise-link">
+      <div class="form-grid">
+        <label>Amount requested €<input type="number" name="amount" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" step="0.01" value="${major(suggestedWiseAmount).toFixed(2)}" required></label>
+        <label>Wise payment request URL<input type="url" name="wise_payment_url" value="${esc(i.wise_payment_url||'')}" placeholder="https://..." required></label>
+      </div>
+      <div class="actions" style="margin-top:12px"><button class="btn gold">Save Wise payment link</button>${i.wise_payment_url?`<button class="btn light" name="remove_wise_link" value="1" formnovalidate>Remove link</button>`:''}</div>
+    </form>`:'<p class="sub"><strong>This invoice is fully paid.</strong> No new Wise request is needed.</p>'}
+    ${customerPayUrl?`<div class="notice" style="margin-top:14px"><strong>Customer payment page</strong><p class="sub" style="margin:5px 0 8px">Share this Sotoboats link with the customer — not the raw Wise URL.</p><div class="actions"><input id="customerPayLink" value="${esc(customerPayUrl)}" readonly style="min-width:min(100%,520px);flex:1"><button class="btn light" type="button" onclick="navigator.clipboard.writeText(document.getElementById('customerPayLink').value);this.textContent='Copied';">Copy link</button><a class="btn light" target="_blank" href="${esc(customerPayUrl)}">Open page</a></div></div>`:''}
+  </section>`:'';
+
   const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}${reminderBtn}${creditBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
 
-  const payment=i.locked_at&&Number(i.outstanding_minor)>0?`<section class="card no-print"><h2>Record payment</h2><form method="post" action="/invoices/${i.id}/payments"><div class="form-grid three"><label>Amount €<input type="number" step="0.01" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" name="amount" value="${major(i.amount_due_now_minor??i.outstanding_minor).toFixed(2)}" required></label><label>Method<select name="method"><option value="bank_transfer">Bank transfer</option><option value="cash">Cash</option><option value="card_external">Card - external</option><option value="other">Other</option></select></label><label>Reference<input name="reference"></label></div><div class="actions" style="margin-top:12px"><button class="btn gold">Record payment</button></div></form></section>`:'';
+  const payment=i.locked_at&&Number(i.outstanding_minor)>0?`<section class="card no-print"><h2>Record payment</h2><form method="post" action="/invoices/${i.id}/payments"><div class="form-grid three"><label>Amount €<input type="number" step="0.01" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" name="amount" value="${major(i.amount_due_now_minor??i.outstanding_minor).toFixed(2)}" required></label><label>Method<select name="method"><option value="wise">Wise</option><option value="bank_transfer">Bank transfer</option><option value="cash">Cash</option><option value="card_external">Card - external</option><option value="other">Other</option></select></label><label>Reference<input name="reference"></label></div><div class="actions" style="margin-top:12px"><button class="btn gold">Record payment</button></div></form></section>`:'';
 
   const credits=creditNotes.length?`<section class="card no-print"><h2>Credit notes</h2><div class="table-wrap"><table><thead><tr><th>Credit note</th><th>Date</th><th>Reason</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${creditNotes.map(c=>`<tr><td><strong>${esc(c.credit_note_number||'Draft')}</strong></td><td>${fmtDate(c.issue_date||c.created_at)}</td><td>${esc(c.reason||'')}</td><td>${euro(c.total_minor)}</td><td>${creditStatusPill(c.status)}</td><td><a class="btn light" href="/credit-notes/${c.id}">Open</a></td></tr>`).join('')}</tbody></table></div></section>`:'';
 
   const audit=data.events.length?`<section class="card no-print"><h2>Audit trail</h2><div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>Actor</th></tr></thead><tbody>${data.events.map(e=>`<tr><td>${fmtDate(e.created_at)}</td><td>${esc(e.event_type.replaceAll('_',' '))}</td><td>${esc(e.actor_name||'System')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
 
-  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${payment}${credits}${audit}`,i.locked_at?'Issued invoices are locked. Payments and credit notes can still be recorded.':'This is a draft and can still be edited.'));
+  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${wisePayment}${payment}${credits}${audit}`,i.locked_at?'Issued invoices are locked. Payments and credit notes can still be recorded.':'This is a draft and can still be edited.'));
 });
 
 app.post('/invoices/:id/issue',async(req,res)=>{
@@ -2164,6 +2302,80 @@ app.post('/invoices/:id/issue',async(req,res)=>{
   }
 });
 
+app.post('/invoices/:id/wise-link',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const i=(await client.query(`
+      SELECT * FROM customer_invoices
+      WHERE id=$1 AND tenant_id=$2
+      FOR UPDATE
+    `,[req.params.id,tenant.id])).rows[0];
+
+    if(!i) throw new Error('Invoice not found.');
+    if(!i.locked_at) throw new Error('Issue the invoice before creating a customer payment page.');
+
+    if(req.body.remove_wise_link==='1'){
+      await client.query(`
+        UPDATE customer_invoices
+        SET wise_payment_url=NULL,
+            wise_payment_amount_minor=NULL,
+            wise_payment_public_token=NULL,
+            wise_payment_updated_at=now(),
+            online_payments_enabled=false,
+            updated_at=now()
+        WHERE id=$1
+      `,[i.id]);
+      await client.query(`
+        INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+        VALUES($1,$2,'wise_payment_link_removed','Sotoboats Admin','{}'::jsonb)
+      `,[tenant.id,i.id]);
+      await client.query('COMMIT');
+      return res.redirect(`/invoices/${i.id}`);
+    }
+
+    const wiseUrl=String(req.body.wise_payment_url||'').trim();
+    let parsedUrl;
+    try{ parsedUrl=new URL(wiseUrl); }
+    catch(_){ throw new Error('Paste a valid Wise payment request URL.'); }
+
+    if(parsedUrl.protocol!=='https:') throw new Error('The Wise payment request must use a secure https:// link.');
+
+    const amount=minor(req.body.amount);
+    if(amount<=0) throw new Error('Enter the amount requested through Wise.');
+    if(amount>Number(i.outstanding_minor||0)) throw new Error(`The Wise request cannot exceed the outstanding balance of ${euro(i.outstanding_minor)}.`);
+
+    const publicToken=String(i.wise_payment_public_token||'').trim()
+      || crypto.randomBytes(24).toString('base64url');
+
+    await client.query(`
+      UPDATE customer_invoices
+      SET wise_payment_url=$1,
+          wise_payment_amount_minor=$2,
+          wise_payment_public_token=$3,
+          wise_payment_updated_at=now(),
+          online_payments_enabled=true,
+          updated_at=now()
+      WHERE id=$4
+    `,[wiseUrl,amount,publicToken,i.id]);
+
+    await client.query(`
+      INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+      VALUES($1,$2,'wise_payment_link_saved','Sotoboats Admin',
+        jsonb_build_object('amount_minor',to_jsonb($3::bigint),'payment_host',to_jsonb($4::text)))
+    `,[tenant.id,i.id,amount,parsedUrl.hostname]);
+
+    await client.query('COMMIT');
+    res.redirect(`/invoices/${i.id}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    res.status(400).send(shell('Wise payment link error','invoices',`<section class="card"><h2>Could not save Wise payment link</h2><p class="sub">${esc(err.message)}</p><div class="actions"><a class="btn light" href="/invoices/${req.params.id}">Back to invoice</a></div></section>`));
+  }finally{
+    client.release();
+  }
+});
+
 app.post('/invoices/:id/payments',async(req,res)=>{
   const client=await pool.connect();
   try{await client.query('BEGIN');const tenant=await getTenant(client);const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];if(!i)throw new Error('Invoice not found.');const amount=minor(req.body.amount);if(amount<=0||amount>Number(i.outstanding_minor))throw new Error('Invalid payment amount.');await client.query(`INSERT INTO customer_invoice_payments(tenant_id,invoice_id,amount_minor,currency_code,method,reference,paid_at) VALUES($1,$2,$3,'EUR',$4,$5,now())`,[tenant.id,i.id,amount,req.body.method||'bank_transfer',req.body.reference||null]);const paid=Number(i.paid_minor)+amount;const outstanding=Math.max(0,Number(i.total_minor)-paid);const status=outstanding===0?'paid':'part_paid';await client.query(`UPDATE customer_invoices SET paid_minor=$1,outstanding_minor=$2,status=$3,amount_due_now_minor=LEAST(COALESCE(amount_due_now_minor,$2),$2),updated_at=now() WHERE id=$4`,[paid,outstanding,status,i.id]);await client.query(`INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details) VALUES($1,$2,'payment_recorded','Sotoboats Admin',jsonb_build_object('amount_minor',to_jsonb($3::bigint),'method',to_jsonb($4::text)))`,[tenant.id,i.id,amount,req.body.method||'bank_transfer']);await client.query('COMMIT');res.redirect(`/invoices/${i.id}`);}catch(err){await client.query('ROLLBACK');res.status(400).send(esc(err.message));}finally{client.release();}
@@ -2206,7 +2418,7 @@ app.post('/invoices/:id/email',async(req,res)=>{
       replyTo:tenant.email || undefined,
       subject,
       html:invoiceEmailHtml(data),
-      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nPlease find attached Sotoboats invoice ${i.invoice_number}.\nBalance due: ${euro(i.outstanding_minor)}\nDue date: ${fmtDate(i.due_date)}\n\nPayment details are included on the attached invoice.\n\nThank you,\nSotoboats`,
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nPlease find attached Sotoboats invoice ${i.invoice_number}.\nBalance due: ${euro(i.outstanding_minor)}\nDue date: ${fmtDate(i.due_date)}\n\n${i.wise_payment_url?`Pay securely via the Sotoboats payment page: ${customerPaymentPageUrl(i)}`:'Payment details are included on the attached invoice.'}\n\nThank you,\nSotoboats`,
       attachments:[{
         filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
         content:pdf,
@@ -2256,7 +2468,7 @@ app.post('/invoices/:id/remind',async(req,res)=>{
       replyTo:tenant.email||undefined,
       subject:`Friendly payment reminder – Sotoboats Invoice ${i.invoice_number}`,
       html:paymentReminderHtml(data),
-      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nJust a friendly reminder that ${euro(i.outstanding_minor)} remains outstanding on Sotoboats invoice ${i.invoice_number}, due ${fmtDate(i.due_date)}.\n\nIf payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.\n\nMany thanks,\nSotoboats`,
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nJust a friendly reminder that ${euro(i.outstanding_minor)} remains outstanding on Sotoboats invoice ${i.invoice_number}, due ${fmtDate(i.due_date)}.\n\nIf payment has already been made, please disregard this message.${i.wise_payment_url?`\n\nPay securely via the Sotoboats payment page: ${customerPaymentPageUrl(i)}`:' Otherwise, the payment details are included on the attached invoice.'}\n\nMany thanks,\nSotoboats`,
       attachments:[{
         filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
         content:pdf,
@@ -2915,7 +3127,22 @@ async function initialiseDatabase() {
       ADD COLUMN IF NOT EXISTS snapshot_identity_number TEXT,
       ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS reminder_count INTEGER NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS credited_minor BIGINT NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS credited_minor BIGINT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS wise_payment_url TEXT,
+      ADD COLUMN IF NOT EXISTS wise_payment_amount_minor BIGINT,
+      ADD COLUMN IF NOT EXISTS wise_payment_public_token TEXT,
+      ADD COLUMN IF NOT EXISTS wise_payment_updated_at TIMESTAMPTZ;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_invoice_wise_token_unique
+      ON customer_invoices(wise_payment_public_token)
+      WHERE wise_payment_public_token IS NOT NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE customer_invoice_payments
+      DROP CONSTRAINT IF EXISTS customer_invoice_payments_method_check;
+    ALTER TABLE customer_invoice_payments
+      ADD CONSTRAINT customer_invoice_payments_method_check
+      CHECK (method IN ('bank_transfer','cash','card_external','stripe','wise','other'));
   `);
 
   await pool.query(`
