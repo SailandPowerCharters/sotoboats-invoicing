@@ -499,8 +499,12 @@ function stripeWebhookSecret() {
 function stripeConfigured() {
   const secret=stripeSecretKey();
   const publishable=stripePublishableKey();
-  if(stripeMode()==='live') return secret.startsWith('sk_live_') && publishable.startsWith('pk_live_');
-  return secret.startsWith('sk_test_') && publishable.startsWith('pk_test_');
+  if(stripeMode()==='live'){
+    return (secret.startsWith('sk_live_') || secret.startsWith('rk_live_'))
+      && publishable.startsWith('pk_live_');
+  }
+  return (secret.startsWith('sk_test_') || secret.startsWith('rk_test_'))
+    && publishable.startsWith('pk_test_');
 }
 
 function stripeClient() {
