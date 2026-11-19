@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const Stripe = require('stripe');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const PDFDocument = require('pdfkit');
@@ -380,6 +381,8 @@ async function readAndApplyExpense(expenseId, tenantId) {
 }
 
 app.set('trust proxy', 1);
+// Stripe webhook must receive the unparsed request body for signature verification.
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -475,6 +478,326 @@ function latestAwaitingPaymentRequest(data) {
 
 function cleanPhoneForWhatsApp(value) {
   return String(value||'').replace(/\D/g,'');
+}
+
+function stripeMode() {
+  return String(process.env.STRIPE_MODE||'test').trim().toLowerCase()==='live' ? 'live' : 'test';
+}
+
+function stripeSecretKey() {
+  return String(process.env.STRIPE_SECRET_KEY||'').trim();
+}
+
+function stripePublishableKey() {
+  return String(process.env.STRIPE_PUBLISHABLE_KEY||'').trim();
+}
+
+function stripeWebhookSecret() {
+  return String(process.env.STRIPE_WEBHOOK_SECRET||'').trim();
+}
+
+function stripeConfigured() {
+  const secret=stripeSecretKey();
+  const publishable=stripePublishableKey();
+  if(stripeMode()==='live') return secret.startsWith('sk_live_') && publishable.startsWith('pk_live_');
+  return secret.startsWith('sk_test_') && publishable.startsWith('pk_test_');
+}
+
+function stripeClient() {
+  if(!stripeConfigured()){
+    throw new Error(
+      stripeMode()==='live'
+        ? 'Stripe live mode is not configured with matching live keys.'
+        : 'Stripe test mode is not configured with matching test keys.'
+    );
+  }
+  return new Stripe(stripeSecretKey());
+}
+
+function stripeCheckoutLabel() {
+  return stripeMode()==='live' ? 'Stripe live' : 'Stripe test';
+}
+
+async function cancelStripePaymentIntentIfPossible(paymentIntentId) {
+  const id=String(paymentIntentId||'').trim();
+  if(!id || !stripeConfigured()) return null;
+  try{
+    const stripe=stripeClient();
+    const intent=await stripe.paymentIntents.retrieve(id);
+    if(['succeeded','canceled'].includes(String(intent.status||''))) return intent;
+    return await stripe.paymentIntents.cancel(id);
+  }catch(err){
+    console.error(`Could not cancel Stripe PaymentIntent ${id}:`,err.message);
+    return null;
+  }
+}
+
+async function ensureStripePaymentIntentForRequest(paymentRequestId) {
+  if(!stripeConfigured()) return {configured:false,mode:stripeMode()};
+
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const r=(await client.query(`
+      SELECT pr.*,i.outstanding_minor AS invoice_outstanding_minor
+      FROM payment_requests pr
+      LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
+      WHERE pr.id=$1
+      FOR UPDATE OF pr
+    `,[paymentRequestId])).rows[0];
+
+    if(!r){
+      await client.query('ROLLBACK');
+      return {configured:true,available:false,reason:'missing'};
+    }
+    if(String(r.status||'')!=='awaiting'){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:String(r.status||'closed')};
+    }
+
+    const requested=Math.max(0,Number(r.amount_minor||0));
+    const linkedOutstanding=r.invoice_id==null?null:Math.max(0,Number(r.invoice_outstanding_minor||0));
+    if(requested<=0 || (linkedOutstanding!==null && linkedOutstanding<=0)){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:'settled'};
+    }
+    if(linkedOutstanding!==null && requested>linkedOutstanding){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:'invoice_changed'};
+    }
+
+    const stripe=stripeClient();
+    let intent=null;
+
+    if(r.stripe_payment_intent_id){
+      try{
+        intent=await stripe.paymentIntents.retrieve(String(r.stripe_payment_intent_id));
+      }catch(err){
+        if(err?.code!=='resource_missing') throw err;
+      }
+    }
+
+    if(intent && Number(intent.amount)!==requested){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:'amount_changed'};
+    }
+
+    if(intent && String(intent.currency||'').toLowerCase()!=='eur'){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:'currency_changed'};
+    }
+
+    if(!intent){
+      const ref=paymentRequestReference(r);
+      intent=await stripe.paymentIntents.create({
+        amount:requested,
+        currency:'eur',
+        payment_method_types:['card'],
+        description:`Sotoboats ${ref} - ${String(r.purpose||'Payment').slice(0,120)}`,
+        receipt_email:String(r.customer_email||'').trim()||undefined,
+        metadata:{
+          payment_request_id:String(r.id),
+          payment_reference:ref,
+          invoice_id:r.invoice_id?String(r.invoice_id):'',
+          customer_name:String(r.customer_name||'').slice(0,500)
+        }
+      },{
+        idempotencyKey:`sotoboats-payment-request-${String(r.id)}`
+      });
+
+      await client.query(`
+        UPDATE payment_requests
+        SET stripe_payment_intent_id=$1,stripe_payment_status=$2,updated_at=now()
+        WHERE id=$3
+      `,[intent.id,String(intent.status||'created'),r.id]);
+    }else{
+      await client.query(`
+        UPDATE payment_requests
+        SET stripe_payment_status=$1,updated_at=now()
+        WHERE id=$2
+      `,[String(intent.status||''),r.id]);
+    }
+
+    await client.query('COMMIT');
+    return {
+      configured:true,
+      available:!!intent.client_secret && String(intent.status||'')!=='canceled',
+      mode:stripeMode(),
+      publishableKey:stripePublishableKey(),
+      clientSecret:intent.client_secret||'',
+      intentId:intent.id,
+      status:String(intent.status||'')
+    };
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    throw err;
+  }finally{
+    client.release();
+  }
+}
+
+async function markPaymentRequestPaidFromStripe(intent, source='stripe') {
+  if(!intent?.id) return null;
+  if(String(intent.status||'')!=='succeeded') return null;
+
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const r=(await client.query(`
+      SELECT * FROM payment_requests
+      WHERE stripe_payment_intent_id=$1
+      FOR UPDATE
+    `,[intent.id])).rows[0];
+
+    if(!r){
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const amount=Number(r.amount_minor||0);
+    const received=Number(intent.amount_received||intent.amount||0);
+    if(received<amount){
+      throw new Error(`Stripe PaymentIntent ${intent.id} succeeded for less than the payment request amount.`);
+    }
+    if(String(intent.currency||'').toLowerCase()!=='eur'){
+      throw new Error(`Stripe PaymentIntent ${intent.id} has an unexpected currency.`);
+    }
+
+    const chargeId=typeof intent.latest_charge==='string'
+      ? intent.latest_charge
+      : (intent.latest_charge?.id||null);
+    const paymentMethod=Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length
+      ? String(intent.payment_method_types[0])
+      : 'card';
+
+    if(String(r.status||'')==='paid'){
+      await client.query(`
+        UPDATE payment_requests
+        SET stripe_payment_status='succeeded',
+            stripe_charge_id=COALESCE($1,stripe_charge_id),
+            stripe_payment_method=COALESCE($2,stripe_payment_method),
+            stripe_paid_at=COALESCE(stripe_paid_at,now()),
+            updated_at=now()
+        WHERE id=$3
+      `,[chargeId,paymentMethod,r.id]);
+      await client.query('COMMIT');
+      return r;
+    }
+
+    if(String(r.status||'')==='cancelled'){
+      throw new Error(`Cancelled payment request ${paymentRequestReference(r)} received a Stripe payment. Manual review is required.`);
+    }
+
+    let invoicePaymentId=null;
+    const paidReference=`Stripe ${intent.id}`;
+
+    if(r.invoice_id){
+      const i=(await client.query(`
+        SELECT * FROM customer_invoices
+        WHERE id=$1 AND tenant_id=$2
+        FOR UPDATE
+      `,[r.invoice_id,r.tenant_id])).rows[0];
+
+      if(!i) throw new Error('Linked invoice could not be found while recording Stripe payment.');
+
+      invoicePaymentId=(await client.query(`
+        INSERT INTO customer_invoice_payments(
+          tenant_id,invoice_id,amount_minor,currency_code,method,reference,paid_at
+        ) VALUES($1,$2,$3,'EUR','stripe',$4,now())
+        RETURNING id
+      `,[r.tenant_id,i.id,amount,paidReference])).rows[0].id;
+
+      const paid=Number(i.paid_minor||0)+amount;
+      const outstanding=Math.max(0,Number(i.total_minor||0)-paid-Number(i.credited_minor||0));
+      const status=outstanding===0?'paid':'part_paid';
+
+      await client.query(`
+        UPDATE customer_invoices
+        SET paid_minor=$1,outstanding_minor=$2,status=$3,
+            amount_due_now_minor=LEAST(COALESCE(amount_due_now_minor,$2),$2),
+            updated_at=now()
+        WHERE id=$4
+      `,[paid,outstanding,status,i.id]);
+
+      await client.query(`
+        INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+        VALUES($1,$2,'payment_recorded','Stripe',
+          jsonb_build_object(
+            'amount_minor',to_jsonb($3::bigint),
+            'method','stripe',
+            'payment_request_id',to_jsonb($4::text),
+            'stripe_payment_intent_id',to_jsonb($5::text),
+            'source',to_jsonb($6::text)
+          ))
+      `,[r.tenant_id,i.id,amount,String(r.id),intent.id,String(source||'stripe')]);
+    }
+
+    await client.query(`
+      UPDATE payment_requests
+      SET status='paid',
+          paid_at=COALESCE(paid_at,now()),
+          paid_reference=$1,
+          invoice_payment_id=COALESCE($2,invoice_payment_id),
+          stripe_payment_status='succeeded',
+          stripe_charge_id=$3,
+          stripe_payment_method=$4,
+          stripe_paid_at=COALESCE(stripe_paid_at,now()),
+          updated_at=now()
+      WHERE id=$5
+    `,[paidReference,invoicePaymentId,chargeId,paymentMethod,r.id]);
+
+    await client.query('COMMIT');
+    return r;
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    throw err;
+  }finally{
+    client.release();
+  }
+}
+
+async function stripeWebhookHandler(req,res) {
+  if(!stripeConfigured()){
+    return res.status(503).send('Stripe is not configured.');
+  }
+  const secret=stripeWebhookSecret();
+  if(!secret){
+    return res.status(503).send('Stripe webhook secret is not configured.');
+  }
+
+  let event;
+  try{
+    event=stripeClient().webhooks.constructEvent(
+      req.body,
+      String(req.headers['stripe-signature']||''),
+      secret
+    );
+  }catch(err){
+    console.error('Stripe webhook signature verification failed:',err.message);
+    return res.status(400).send('Invalid Stripe webhook signature.');
+  }
+
+  try{
+    const intent=event?.data?.object;
+    if(event.type==='payment_intent.succeeded'){
+      await markPaymentRequestPaidFromStripe(intent,`webhook:${event.id}`);
+    }else if([
+      'payment_intent.payment_failed',
+      'payment_intent.canceled',
+      'payment_intent.processing',
+      'payment_intent.requires_action'
+    ].includes(event.type) && intent?.id){
+      await pool.query(`
+        UPDATE payment_requests
+        SET stripe_payment_status=$1,updated_at=now()
+        WHERE stripe_payment_intent_id=$2
+      `,[String(intent.status||event.type),intent.id]);
+    }
+    return res.json({received:true});
+  }catch(err){
+    console.error('Stripe webhook processing failed:',err);
+    return res.status(500).send('Stripe webhook processing failed.');
+  }
 }
 
 async function getTenant(client = pool) {
@@ -1058,7 +1381,7 @@ app.get('/payment/:token',async(req,res)=>{
     const token=String(req.params.token||'').trim();
     if(!token || token.length<20) return res.status(404).send('Payment request not found.');
 
-    const r=(await pool.query(`
+    let r=(await pool.query(`
       SELECT pr.*,
              t.trading_name,t.legal_name,t.email AS business_email,t.phone AS business_phone,
              t.bank_account_name,t.bank_name,t.bank_iban,t.bank_bic,t.bank_address,
@@ -1084,6 +1407,30 @@ app.get('/payment/:token',async(req,res)=>{
     const bic=String(r.bank_bic||'').trim();
     const bankAddress=String(r.bank_address||'').trim();
 
+    let stripeState={configured:false,mode:stripeMode()};
+    if(active && stripeConfigured()){
+      try{
+        stripeState=await ensureStripePaymentIntentForRequest(r.id);
+      }catch(err){
+        console.error('Stripe checkout preparation failed:',err);
+        stripeState={configured:true,available:false,mode:stripeMode(),error:'Card checkout is temporarily unavailable.'};
+      }
+    }
+
+    const bankBlock=`<details class="bank-wrap">
+      <summary>Pay by bank transfer instead</summary>
+      <div class="bank">
+        <div class="bank-title">Wise bank transfer</div>
+        <div class="bank-row"><span>Beneficiary</span><strong>${esc(accountName)}</strong></div>
+        <div class="bank-row"><span>Bank</span><strong>${esc(bankName)}</strong></div>
+        <div class="bank-row"><span>IBAN</span><strong>${esc(iban)}</strong><button type="button" onclick="copyText(${JSON.stringify(iban)},this)">Copy</button></div>
+        <div class="bank-row"><span>SWIFT / BIC</span><strong>${esc(bic)}</strong><button type="button" onclick="copyText(${JSON.stringify(bic)},this)">Copy</button></div>
+        ${bankAddress?`<div class="bank-row"><span>Bank address</span><strong>${esc(bankAddress)}</strong></div>`:''}
+        <div class="bank-row reference"><span>Payment reference</span><strong>${esc(requestRef)}</strong><button type="button" onclick="copyText(${JSON.stringify(requestRef)},this)">Copy</button></div>
+      </div>
+      <div class="important"><strong>Please use the payment reference exactly as shown.</strong><span>This lets Sotoboats match your bank transfer quickly.</span></div>
+    </details>`;
+
     let statusContent='';
     if(String(r.status||'')==='paid' || invoiceSettled){
       statusContent=`<div class="status paid"><strong>Payment received</strong><span>Thank you. This payment request has been settled.</span></div>`;
@@ -1092,17 +1439,114 @@ app.get('/payment/:token',async(req,res)=>{
     }else if(requestTooHigh){
       statusContent=`<div class="status warn"><strong>Payment request needs updating</strong><span>The linked invoice balance has changed. Please contact Sotoboats before making payment.</span></div>`;
     }else{
-      statusContent=`<div class="bank">
-        <div class="bank-title">Pay by bank transfer</div>
-        <div class="bank-row"><span>Beneficiary</span><strong>${esc(accountName)}</strong></div>
-        <div class="bank-row"><span>Bank</span><strong>${esc(bankName)}</strong></div>
-        <div class="bank-row"><span>IBAN</span><strong id="ibanValue">${esc(iban)}</strong><button type="button" onclick="copyText('${esc(iban)}',this)">Copy</button></div>
-        <div class="bank-row"><span>SWIFT / BIC</span><strong>${esc(bic)}</strong><button type="button" onclick="copyText('${esc(bic)}',this)">Copy</button></div>
-        ${bankAddress?`<div class="bank-row"><span>Bank address</span><strong>${esc(bankAddress)}</strong></div>`:''}
-        <div class="bank-row reference"><span>Payment reference</span><strong>${esc(requestRef)}</strong><button type="button" onclick="copyText('${esc(requestRef)}',this)">Copy</button></div>
-      </div>
-      <div class="important"><strong>Please use the payment reference exactly as shown.</strong><span>This lets Sotoboats match your payment quickly.</span></div>`;
+      const testBanner=stripeState.configured && stripeState.mode==='test'
+        ? `<div class="test-banner"><strong>TEST MODE</strong><span>No real card will be charged while Sotoboats finishes Stripe verification.</span></div>`
+        : '';
+      const cardBlock=stripeState.configured && stripeState.available
+        ? `${testBanner}
+           <section class="card-checkout">
+             <div class="card-title"><div><span>Pay by card</span><strong>${euro(requested)}</strong></div><div class="secure-chip">Secure checkout</div></div>
+             <form id="stripe-payment-form">
+               <div id="payment-element"></div>
+               <button id="stripe-submit" class="pay-card" type="submit"><span id="stripe-button-text">Pay ${euro(requested)}</span></button>
+               <div id="stripe-message" class="stripe-message" role="alert"></div>
+             </form>
+             <p class="powered">Secure card payment powered by Stripe. Sotoboats does not receive or store your card number.</p>
+           </section>
+           <div class="divider"><span>or</span></div>
+           ${bankBlock}`
+        : `${testBanner}
+           ${stripeState.configured?`<div class="status warn"><strong>Card checkout temporarily unavailable</strong><span>${esc(stripeState.error||'Please use bank transfer below or contact Sotoboats.')}</span></div>`:''}
+           ${bankBlock}`;
+      statusContent=cardBlock;
     }
+
+    const stripeScript=(active && stripeState.configured && stripeState.available)
+      ? `<script src="https://js.stripe.com/v3/"></script>
+         <script>
+         (function(){
+           const stripe=Stripe(${JSON.stringify(stripeState.publishableKey)});
+           const appearance={
+             theme:'stripe',
+             variables:{
+               colorPrimary:'#caa86d',
+               colorBackground:'#ffffff',
+               colorText:'#0b1d2f',
+               colorDanger:'#b42318',
+               fontFamily:'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+               borderRadius:'10px',
+               spacingUnit:'4px'
+             }
+           };
+           const elements=stripe.elements({
+             clientSecret:${JSON.stringify(stripeState.clientSecret)},
+             appearance
+           });
+           const paymentElement=elements.create('payment',{
+             layout:'tabs',
+             defaultValues:{
+               billingDetails:{
+                 name:${JSON.stringify(String(r.customer_name||''))},
+                 email:${JSON.stringify(String(r.customer_email||''))}
+               }
+             }
+           });
+           paymentElement.mount('#payment-element');
+
+           const form=document.getElementById('stripe-payment-form');
+           const submit=document.getElementById('stripe-submit');
+           const buttonText=document.getElementById('stripe-button-text');
+           const message=document.getElementById('stripe-message');
+
+           async function syncStatus(){
+             try{
+               const response=await fetch(${JSON.stringify(`/payment/${token}/stripe-status`)},{
+                 method:'POST',
+                 headers:{'Content-Type':'application/json'},
+                 body:'{}'
+               });
+               if(!response.ok) return null;
+               const data=await response.json();
+               if(data.status==='paid'){
+                 window.location.replace(${JSON.stringify(`/payment/${token}`)});
+                 return data;
+               }
+               return data;
+             }catch(_){ return null; }
+           }
+
+           syncStatus();
+
+           form.addEventListener('submit',async function(event){
+             event.preventDefault();
+             submit.disabled=true;
+             buttonText.textContent='Processing…';
+             message.textContent='';
+
+             const result=await stripe.confirmPayment({
+               elements,
+               confirmParams:{
+                 return_url:window.location.origin+${JSON.stringify(`/payment/${token}`)}
+               },
+               redirect:'if_required'
+             });
+
+             if(result.error){
+               message.textContent=result.error.message||'Your payment could not be completed.';
+               submit.disabled=false;
+               buttonText.textContent=${JSON.stringify(`Pay ${euro(requested)}`)};
+               return;
+             }
+
+             message.textContent='Payment received. Confirming with Sotoboats…';
+             const synced=await syncStatus();
+             if(!synced || synced.status!=='paid'){
+               setTimeout(syncStatus,1200);
+             }
+           });
+         })();
+         </script>`
+      : '';
 
     res.send(`<!doctype html><html><head>
       <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1123,20 +1567,31 @@ app.get('/payment/:token',async(req,res)=>{
         .amount{margin:20px 0;padding:20px;border-radius:14px;background:#f6f1e8;text-align:center}
         .amount span{display:block;color:#796747;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
         .amount strong{display:block;margin-top:5px;font-size:34px;font-family:Georgia,"Times New Roman",serif}
-        .bank{margin-top:20px;border:1px solid #dce3e6;border-radius:14px;overflow:hidden}.bank-title{padding:13px 14px;background:#0b1d2f;color:#fff;font-weight:850}
+        .card-checkout{margin-top:20px;border:1px solid #dce3e6;border-radius:15px;padding:18px;background:#fff}
+        .card-title{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:16px}
+        .card-title span,.card-title strong{display:block}.card-title span{font-size:12px;font-weight:800}.card-title strong{margin-top:3px;font-size:21px}
+        .secure-chip{border-radius:999px;background:#eef5f8;padding:7px 10px;color:#53707e;font-size:10px;font-weight:800}
+        .pay-card{width:100%;margin-top:16px;border:0;border-radius:11px;background:#caa86d;color:#0b1d2f;padding:15px 18px;font-size:15px;font-weight:900;cursor:pointer}
+        .pay-card:disabled{opacity:.6;cursor:wait}.stripe-message{margin-top:11px;color:#b42318;font-size:12px;line-height:1.5}.powered{margin:12px 2px 0;color:#7a898f;font-size:10px;line-height:1.55;text-align:center}
+        .test-banner{display:flex;gap:12px;align-items:center;margin:0 0 14px;padding:12px 14px;border-radius:11px;background:#fff6df;color:#755511}
+        .test-banner strong{font-size:10px;letter-spacing:.08em}.test-banner span{font-size:11px;line-height:1.4}
+        .divider{display:flex;align-items:center;gap:12px;margin:18px 0;color:#8a989e;font-size:11px}.divider:before,.divider:after{content:"";height:1px;background:#e0e6e9;flex:1}
+        .bank-wrap{margin-top:14px;border:1px solid #dce3e6;border-radius:14px;background:#fff;overflow:hidden}
+        .bank-wrap summary{cursor:pointer;padding:14px 16px;font-weight:850;list-style:none}.bank-wrap summary::-webkit-details-marker{display:none}
+        .bank{border-top:1px solid #dce3e6}.bank-title{padding:13px 14px;background:#0b1d2f;color:#fff;font-weight:850}
         .bank-row{display:grid;grid-template-columns:110px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #e4e9ec}.bank-row span{font-size:10px;color:#71818a;text-transform:uppercase}.bank-row strong{font-size:12px;word-break:break-word}
         .bank-row button{border:1px solid #d3dde2;border-radius:8px;background:#fff;padding:7px 9px;font-weight:800;cursor:pointer}.bank-row.reference{background:#f6f1e8}
-        .important{margin-top:15px;padding:14px;border-radius:12px;background:#eef5f8}.important strong,.important span{display:block}.important span{margin-top:5px;color:#60747f;font-size:11px}
+        .important{margin:12px;padding:12px;border-radius:10px;background:#eef5f8}.important strong,.important span{display:block}.important span{margin-top:5px;color:#60747f;font-size:11px}
         .status{padding:18px;border-radius:12px}.status strong,.status span{display:block}.status strong{font-size:15px}.status span{margin-top:6px;font-size:12px;line-height:1.5}
         .status.paid{background:#edf8f1;color:#236642}.status.warn{background:#fff6df;color:#7b5a11}
         .footer{padding:16px 25px;border-top:1px solid #e1e7ea;background:#fafcfc;color:#7b8a91;font-size:10px;line-height:1.5;text-align:center}
-        @media(max-width:520px){.wrap{padding:14px 9px 30px}.head,.body{padding:20px}.row{align-items:flex-start;flex-direction:column;gap:4px}.row strong{text-align:left}.bank-row{grid-template-columns:1fr auto}.bank-row span{grid-column:1/-1}}
+        @media(max-width:520px){.wrap{padding:14px 9px 30px}.head,.body{padding:20px}.row{align-items:flex-start;flex-direction:column;gap:4px}.row strong{text-align:left}.bank-row{grid-template-columns:1fr auto}.bank-row span{grid-column:1/-1}.card-title{align-items:flex-start}}
       </style></head><body><main class="wrap">
         <div class="brand"><img src="/sotoboats-logo.png" alt="Sotoboats"></div>
         <section class="card">
-          <header class="head"><div class="eyebrow">Payment request</div><h1>${esc(requestRef)}</h1></header>
+          <header class="head"><div class="eyebrow">Secure payment request</div><h1>${esc(requestRef)}</h1></header>
           <div class="body">
-            <p class="sub">Payment requested by Sotoboats. Please check the details below before making your transfer.</p>
+            <p class="sub">Payment requested by Sotoboats. Please check the details below and choose how you would like to pay.</p>
             <div class="details">
               <div class="row"><span>Customer</span><strong>${esc(r.customer_name||'')}</strong></div>
               <div class="row"><span>For</span><strong>${esc(r.purpose||'')}</strong></div>
@@ -1158,10 +1613,42 @@ app.get('/payment/:token',async(req,res)=>{
         }
       }
       </script>
+      ${stripeScript}
       </body></html>`);
   }catch(err){
     console.error('Public payment request failed:',err);
     res.status(500).send('Payment request could not be loaded.');
+  }
+});
+
+app.post('/payment/:token/stripe-status',async(req,res)=>{
+  try{
+    if(!stripeConfigured()) return res.status(503).json({ok:false,status:'unavailable'});
+    const token=String(req.params.token||'').trim();
+    const r=(await pool.query(`
+      SELECT * FROM payment_requests WHERE public_token=$1 LIMIT 1
+    `,[token])).rows[0];
+    if(!r) return res.status(404).json({ok:false,status:'missing'});
+    if(String(r.status||'')==='paid') return res.json({ok:true,status:'paid'});
+    if(!r.stripe_payment_intent_id) return res.json({ok:true,status:String(r.status||'awaiting')});
+
+    const intent=await stripeClient().paymentIntents.retrieve(String(r.stripe_payment_intent_id),{
+      expand:['latest_charge']
+    });
+
+    await pool.query(`
+      UPDATE payment_requests SET stripe_payment_status=$1,updated_at=now()
+      WHERE id=$2
+    `,[String(intent.status||''),r.id]);
+
+    if(String(intent.status||'')==='succeeded'){
+      await markPaymentRequestPaidFromStripe(intent,'customer-status-check');
+      return res.json({ok:true,status:'paid'});
+    }
+    return res.json({ok:true,status:String(r.status||'awaiting'),stripe_status:String(intent.status||'')});
+  }catch(err){
+    console.error('Stripe payment status check failed:',err);
+    return res.status(500).json({ok:false,status:'error'});
   }
 });
 
@@ -1277,7 +1764,8 @@ app.get('/payment-requests',async(req,res)=>{
     const phone=cleanPhoneForWhatsApp(r.customer_phone);
     const message=`Hi ${r.customer_name||''}, here is your Sotoboats payment request for ${euro(r.amount_minor)} (${ref}): ${url}`;
     const wa=phone?`https://wa.me/${phone}?text=${encodeURIComponent(message)}`:`https://wa.me/?text=${encodeURIComponent(message)}`;
-    const status=r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>';
+    const stripeInfo=r.stripe_payment_intent_id?`<br><span class="muted">Card: ${esc(r.stripe_payment_status||'ready')}</span>`:'';
+    const status=(r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>')+stripeInfo;
     const share=r.share_count>0?`${Number(r.share_count)} · ${fmtDate(r.shared_at)}${r.last_shared_channel?` · ${esc(r.last_shared_channel)}`:''}`:'Not shared';
     return `<tr>
       <td><strong>${esc(ref)}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td>
@@ -1291,7 +1779,7 @@ app.get('/payment-requests',async(req,res)=>{
         <button class="btn light" type="button" onclick="copyPaymentRequest('${r.id}','${esc(url)}',this)">Copy link</button>
         <a class="btn light" target="_blank" href="${esc(wa)}" onclick="recordPaymentShare('${r.id}','whatsapp')">WhatsApp</a>
         <a class="btn light" target="_blank" href="${esc(url)}">Open</a>
-        ${r.status==='awaiting'?`<form method="post" action="/payment-requests/${r.id}/paid" onsubmit="return confirm('Mark ${esc(ref)} as paid?');"><input name="reference" placeholder="Wise reference (optional)"><button class="btn gold">Mark paid</button></form><form method="post" action="/payment-requests/${r.id}/cancel" onsubmit="return confirm('Cancel this payment request?');"><button class="btn light">Cancel</button></form>`:''}
+        ${r.status==='awaiting'?`<form method="post" action="/payment-requests/${r.id}/paid" onsubmit="return confirm('Mark ${esc(ref)} as paid by bank transfer?');"><input name="reference" placeholder="Wise reference (optional)"><button class="btn gold">Mark bank transfer paid</button></form><form method="post" action="/payment-requests/${r.id}/cancel" onsubmit="return confirm('Cancel this payment request?');"><button class="btn light">Cancel</button></form>`:''}
       </div></td>
     </tr>`;
   }).join('')}</tbody></table></div>`:'<p class="sub">No payment requests yet.</p>';
@@ -1304,7 +1792,7 @@ app.get('/payment-requests',async(req,res)=>{
   </div>
   <section class="card">
     <div class="actions" style="justify-content:space-between;margin-bottom:14px">
-      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Create a Sotoboats-branded payment link, send it on the spot and keep a record of what was shared.</p></div>
+      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Create a Sotoboats-branded payment link, take card payments through Stripe, send it on the spot and keep a record of what was shared.</p></div>
       <a class="btn gold" href="/payment-requests/new">+ New payment request</a>
     </div>
     ${table}
@@ -1329,7 +1817,7 @@ app.get('/payment-requests',async(req,res)=>{
     }
   }
   </script>`;
-  res.send(shell('Payment Requests','payment-requests',content,'Quick Sotoboats payment links using the approved Wise bank account.'));
+  res.send(shell('Payment Requests','payment-requests',content,'Tracked Sotoboats payment links with Stripe card checkout and Wise bank transfer fallback.'));
 });
 
 app.get('/payment-requests/new',async(req,res)=>{
@@ -1350,7 +1838,7 @@ app.get('/payment-requests/new',async(req,res)=>{
   const options=['<option value="">No invoice — standalone payment request</option>'].concat(invoices.map(i=>`<option value="${i.id}" ${selected&&selected.id===i.id?'selected':''}>${esc(i.invoice_number||'Invoice')} · ${esc(i.contact_name||'')} · ${euro(i.outstanding_minor)} outstanding</option>`)).join('');
 
   const content=`<section class="form-card">
-    <div class="actions" style="justify-content:space-between"><div><h2>New payment request</h2><p class="sub">Create the link while you are with the customer, then copy it or send it by WhatsApp.</p></div><a class="btn light" href="/payment-requests">Back</a></div>
+    <div class="actions" style="justify-content:space-between"><div><h2>New payment request</h2><p class="sub">Create the link while you are with the customer, then copy it or send it by WhatsApp. Card payments can be confirmed automatically by Stripe.</p></div><a class="btn light" href="/payment-requests">Back</a></div>
     <form method="post" action="/payment-requests">
       <div class="form-grid">
         <label>Customer name<input name="customer_name" value="${esc(selected?.contact_name||'')}" required></label>
@@ -1360,11 +1848,11 @@ app.get('/payment-requests/new',async(req,res)=>{
         <label class="full">What is this payment for?<input name="purpose" value="${esc(selected?.service_title||'')}" placeholder="e.g. Catamaran deposit, charter balance, boat delivery" required></label>
         <label class="full">Link to invoice (optional)<select name="invoice_id">${options}</select></label>
       </div>
-      <div class="notice" style="margin-top:12px"><strong>Payment destination</strong><br>${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'Wise')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</div>
+      <div class="notice" style="margin-top:12px"><strong>Payment options</strong><br>Card: ${stripeConfigured()?`${esc(stripeCheckoutLabel())} checkout ready`:`Stripe keys not added yet`}<br>Bank transfer fallback: ${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'Wise')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</div>
       <div class="actions" style="margin-top:14px"><button class="btn gold">Create payment request</button></div>
     </form>
   </section>`;
-  res.send(shell('New Payment Request','payment-requests',content,'A tracked Sotoboats link that pays into Dave’s approved Wise account.'));
+  res.send(shell('New Payment Request','payment-requests',content,'A tracked Sotoboats link with card checkout plus Wise bank transfer fallback.'));
 });
 
 app.post('/payment-requests',async(req,res)=>{
@@ -1427,12 +1915,32 @@ app.post('/payment-requests/:id/shared',async(req,res)=>{
 
 app.post('/payment-requests/:id/cancel',async(req,res)=>{
   const tenant=await getTenant();
+  const existing=(await pool.query(`
+    SELECT * FROM payment_requests
+    WHERE id=$1 AND tenant_id=$2
+    LIMIT 1
+  `,[req.params.id,tenant.id])).rows[0];
+  if(!existing || existing.status!=='awaiting'){
+    return res.status(400).send(shell('Payment request','payment-requests',`<section class="card"><h2>Could not cancel payment request</h2><p class="sub">It may already be paid or cancelled.</p><a class="btn light" href="/payment-requests">Back</a></section>`));
+  }
+
+  if(existing.stripe_payment_intent_id){
+    const cancelled=await cancelStripePaymentIntentIfPossible(existing.stripe_payment_intent_id);
+    if(cancelled){
+      await pool.query(`
+        UPDATE payment_requests SET stripe_payment_status=$1,updated_at=now()
+        WHERE id=$2 AND tenant_id=$3
+      `,[String(cancelled.status||'canceled'),existing.id,tenant.id]);
+    }
+  }
+
   const updated=(await pool.query(`
     UPDATE payment_requests
     SET status='cancelled',cancelled_at=now(),updated_at=now()
     WHERE id=$1 AND tenant_id=$2 AND status='awaiting'
     RETURNING *
   `,[req.params.id,tenant.id])).rows[0];
+
   if(!updated) return res.status(400).send(shell('Payment request','payment-requests',`<section class="card"><h2>Could not cancel payment request</h2><p class="sub">It may already be paid or cancelled.</p><a class="btn light" href="/payment-requests">Back</a></section>`));
   res.redirect('/payment-requests');
 });
@@ -1448,6 +1956,16 @@ app.post('/payment-requests/:id/paid',async(req,res)=>{
 
     let invoicePaymentId=null;
     const paidReference=String(req.body.reference||'').trim()||paymentRequestReference(r);
+
+    if(r.stripe_payment_intent_id){
+      const cancelled=await cancelStripePaymentIntentIfPossible(r.stripe_payment_intent_id);
+      if(cancelled){
+        await client.query(`
+          UPDATE payment_requests SET stripe_payment_status=$1,updated_at=now()
+          WHERE id=$2
+        `,[String(cancelled.status||'canceled'),r.id]);
+      }
+    }
 
     if(r.invoice_id){
       const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[r.invoice_id,tenant.id])).rows[0];
@@ -3571,6 +4089,11 @@ async function initialiseDatabase() {
       paid_at TIMESTAMPTZ,
       paid_reference TEXT,
       invoice_payment_id UUID REFERENCES customer_invoice_payments(id) ON DELETE SET NULL,
+      stripe_payment_intent_id TEXT,
+      stripe_payment_status TEXT,
+      stripe_charge_id TEXT,
+      stripe_payment_method TEXT,
+      stripe_paid_at TIMESTAMPTZ,
       cancelled_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -3579,6 +4102,21 @@ async function initialiseDatabase() {
       ON payment_requests(tenant_id,status,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice
       ON payment_requests(invoice_id,created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
+      ON payment_requests(stripe_payment_intent_id)
+      WHERE stripe_payment_intent_id IS NOT NULL;
+  `);
+
+  await pool.query(`
+    ALTER TABLE payment_requests
+      ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT,
+      ADD COLUMN IF NOT EXISTS stripe_payment_status TEXT,
+      ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT,
+      ADD COLUMN IF NOT EXISTS stripe_payment_method TEXT,
+      ADD COLUMN IF NOT EXISTS stripe_paid_at TIMESTAMPTZ;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
+      ON payment_requests(stripe_payment_intent_id)
+      WHERE stripe_payment_intent_id IS NOT NULL;
   `);
 
   await pool.query(`
