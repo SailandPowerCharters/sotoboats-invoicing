@@ -458,6 +458,25 @@ function paymentAmountForInvoice(invoice) {
   return outstanding;
 }
 
+function paymentRequestPageUrl(request, req=null) {
+  const token=String(request?.public_token||'').trim();
+  if(!token) return '';
+  return `${publicAppBaseUrl(req)}/payment/${encodeURIComponent(token)}`;
+}
+
+function paymentRequestReference(request) {
+  const n=Number(request?.request_number||0);
+  return n>0 ? `SBP-${String(n).padStart(6,'0')}` : 'Sotoboats payment';
+}
+
+function latestAwaitingPaymentRequest(data) {
+  return (data?.payment_requests||[]).find(r=>String(r.status||'').toLowerCase()==='awaiting') || null;
+}
+
+function cleanPhoneForWhatsApp(value) {
+  return String(value||'').replace(/\D/g,'');
+}
+
 async function getTenant(client = pool) {
   const { rows } = await client.query(`SELECT * FROM invoice_tenants WHERE code='SOTOBOATS' LIMIT 1`);
   if (!rows[0]) throw new Error('Sotoboats tenant is missing. Database startup initialisation did not complete.');
@@ -543,12 +562,20 @@ async function loadInvoice(id) {
     WHERE i.id=$1 AND i.tenant_id=$2
   `,[id,tenant.id])).rows[0];
   if (!invoice) return null;
-  const [items,payments,events] = await Promise.all([
+  const [items,payments,events,paymentRequests] = await Promise.all([
     pool.query(`SELECT * FROM customer_invoice_items WHERE invoice_id=$1 ORDER BY sort_order`,[id]),
     pool.query(`SELECT * FROM customer_invoice_payments WHERE invoice_id=$1 ORDER BY paid_at,created_at`,[id]),
-    pool.query(`SELECT * FROM customer_invoice_events WHERE invoice_id=$1 ORDER BY created_at DESC`,[id])
+    pool.query(`SELECT * FROM customer_invoice_events WHERE invoice_id=$1 ORDER BY created_at DESC`,[id]),
+    pool.query(`SELECT * FROM payment_requests WHERE invoice_id=$1 AND tenant_id=$2 ORDER BY created_at DESC`,[id,tenant.id])
   ]);
-  return { tenant, invoice, items:items.rows, payments:payments.rows, events:events.rows };
+  return {
+    tenant,
+    invoice,
+    items:items.rows,
+    payments:payments.rows,
+    events:events.rows,
+    payment_requests:paymentRequests.rows
+  };
 }
 
 
@@ -773,6 +800,7 @@ const nav = (active) => `
     <nav>
       <a class="${active==='dashboard'?'active':''}" href="/">Dashboard</a>
       <a class="${active==='invoices'?'active':''}" href="/invoices">Invoices</a>
+      <a class="${active==='payment-requests'?'active':''}" href="/payment-requests">Payment Requests</a>
       <a class="${active==='credit-notes'?'active':''}" href="/credit-notes">Credit Notes</a>
       <a class="${active==='expenses'?'active':''}" href="/expenses">Expenses</a>
       <a class="${active==='month-end'?'active':''}" href="/month-end">Gestor</a>
@@ -1025,6 +1053,118 @@ app.get('/gestor/pack.zip',requireGestorAuth,async(req,res)=>{
   }
 });
 
+app.get('/payment/:token',async(req,res)=>{
+  try{
+    const token=String(req.params.token||'').trim();
+    if(!token || token.length<20) return res.status(404).send('Payment request not found.');
+
+    const r=(await pool.query(`
+      SELECT pr.*,
+             t.trading_name,t.legal_name,t.email AS business_email,t.phone AS business_phone,
+             t.bank_account_name,t.bank_name,t.bank_iban,t.bank_bic,t.bank_address,
+             i.invoice_number,i.outstanding_minor AS invoice_outstanding_minor
+      FROM payment_requests pr
+      JOIN invoice_tenants t ON t.id=pr.tenant_id
+      LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
+      WHERE pr.public_token=$1
+      LIMIT 1
+    `,[token])).rows[0];
+
+    if(!r) return res.status(404).send('Payment request not found.');
+
+    const requestRef=paymentRequestReference(r);
+    const requested=Math.max(0,Number(r.amount_minor||0));
+    const linkedOutstanding=r.invoice_id==null?null:Math.max(0,Number(r.invoice_outstanding_minor||0));
+    const invoiceSettled=linkedOutstanding!==null && linkedOutstanding<=0;
+    const requestTooHigh=linkedOutstanding!==null && linkedOutstanding>0 && requested>linkedOutstanding;
+    const active=String(r.status||'')==='awaiting' && !invoiceSettled && !requestTooHigh;
+    const bankName=String(r.bank_name||'Wise').trim();
+    const accountName=String(r.bank_account_name||'').trim();
+    const iban=String(r.bank_iban||'').trim();
+    const bic=String(r.bank_bic||'').trim();
+    const bankAddress=String(r.bank_address||'').trim();
+
+    let statusContent='';
+    if(String(r.status||'')==='paid' || invoiceSettled){
+      statusContent=`<div class="status paid"><strong>Payment received</strong><span>Thank you. This payment request has been settled.</span></div>`;
+    }else if(String(r.status||'')==='cancelled'){
+      statusContent=`<div class="status warn"><strong>Payment request cancelled</strong><span>Please contact Sotoboats if you still need to make a payment.</span></div>`;
+    }else if(requestTooHigh){
+      statusContent=`<div class="status warn"><strong>Payment request needs updating</strong><span>The linked invoice balance has changed. Please contact Sotoboats before making payment.</span></div>`;
+    }else{
+      statusContent=`<div class="bank">
+        <div class="bank-title">Pay by bank transfer</div>
+        <div class="bank-row"><span>Beneficiary</span><strong>${esc(accountName)}</strong></div>
+        <div class="bank-row"><span>Bank</span><strong>${esc(bankName)}</strong></div>
+        <div class="bank-row"><span>IBAN</span><strong id="ibanValue">${esc(iban)}</strong><button type="button" onclick="copyText('${esc(iban)}',this)">Copy</button></div>
+        <div class="bank-row"><span>SWIFT / BIC</span><strong>${esc(bic)}</strong><button type="button" onclick="copyText('${esc(bic)}',this)">Copy</button></div>
+        ${bankAddress?`<div class="bank-row"><span>Bank address</span><strong>${esc(bankAddress)}</strong></div>`:''}
+        <div class="bank-row reference"><span>Payment reference</span><strong>${esc(requestRef)}</strong><button type="button" onclick="copyText('${esc(requestRef)}',this)">Copy</button></div>
+      </div>
+      <div class="important"><strong>Please use the payment reference exactly as shown.</strong><span>This lets Sotoboats match your payment quickly.</span></div>`;
+    }
+
+    res.send(`<!doctype html><html><head>
+      <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="theme-color" content="#0b1d2f">
+      <title>Sotoboats Payment ${esc(requestRef)}</title>
+      <style>
+        *{box-sizing:border-box}
+        body{margin:0;background:#f3f6f7;color:#0b1d2f;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .wrap{width:min(100%,650px);margin:auto;padding:28px 16px 46px}
+        .brand{text-align:center;margin-bottom:18px}.brand img{width:230px;max-width:72%;height:auto}
+        .card{overflow:hidden;border:1px solid #dce3e6;border-radius:20px;background:#fff;box-shadow:0 18px 50px rgba(11,29,47,.09)}
+        .head{padding:24px 25px;background:#0b1d2f;color:#fff}.eyebrow{color:#caa86d;font-size:11px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
+        h1{margin:7px 0 0;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:600}
+        .body{padding:25px}.sub{margin:0 0 20px;color:#667783;font-size:13px;line-height:1.6}
+        .details{display:grid;gap:1px;margin:0 0 20px;border:1px solid #e0e6e9;border-radius:13px;overflow:hidden;background:#e0e6e9}
+        .row{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:13px 14px;background:#fff}
+        .row span{color:#70818b;font-size:11px}.row strong{font-size:13px;text-align:right}
+        .amount{margin:20px 0;padding:20px;border-radius:14px;background:#f6f1e8;text-align:center}
+        .amount span{display:block;color:#796747;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+        .amount strong{display:block;margin-top:5px;font-size:34px;font-family:Georgia,"Times New Roman",serif}
+        .bank{margin-top:20px;border:1px solid #dce3e6;border-radius:14px;overflow:hidden}.bank-title{padding:13px 14px;background:#0b1d2f;color:#fff;font-weight:850}
+        .bank-row{display:grid;grid-template-columns:110px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #e4e9ec}.bank-row span{font-size:10px;color:#71818a;text-transform:uppercase}.bank-row strong{font-size:12px;word-break:break-word}
+        .bank-row button{border:1px solid #d3dde2;border-radius:8px;background:#fff;padding:7px 9px;font-weight:800;cursor:pointer}.bank-row.reference{background:#f6f1e8}
+        .important{margin-top:15px;padding:14px;border-radius:12px;background:#eef5f8}.important strong,.important span{display:block}.important span{margin-top:5px;color:#60747f;font-size:11px}
+        .status{padding:18px;border-radius:12px}.status strong,.status span{display:block}.status strong{font-size:15px}.status span{margin-top:6px;font-size:12px;line-height:1.5}
+        .status.paid{background:#edf8f1;color:#236642}.status.warn{background:#fff6df;color:#7b5a11}
+        .footer{padding:16px 25px;border-top:1px solid #e1e7ea;background:#fafcfc;color:#7b8a91;font-size:10px;line-height:1.5;text-align:center}
+        @media(max-width:520px){.wrap{padding:14px 9px 30px}.head,.body{padding:20px}.row{align-items:flex-start;flex-direction:column;gap:4px}.row strong{text-align:left}.bank-row{grid-template-columns:1fr auto}.bank-row span{grid-column:1/-1}}
+      </style></head><body><main class="wrap">
+        <div class="brand"><img src="/sotoboats-logo.png" alt="Sotoboats"></div>
+        <section class="card">
+          <header class="head"><div class="eyebrow">Payment request</div><h1>${esc(requestRef)}</h1></header>
+          <div class="body">
+            <p class="sub">Payment requested by Sotoboats. Please check the details below before making your transfer.</p>
+            <div class="details">
+              <div class="row"><span>Customer</span><strong>${esc(r.customer_name||'')}</strong></div>
+              <div class="row"><span>For</span><strong>${esc(r.purpose||'')}</strong></div>
+              ${r.invoice_number?`<div class="row"><span>Invoice</span><strong>${esc(r.invoice_number)}</strong></div>`:''}
+              <div class="row"><span>Reference</span><strong>${esc(requestRef)}</strong></div>
+            </div>
+            <div class="amount"><span>Amount requested</span><strong>${euro(requested)}</strong></div>
+            ${statusContent}
+          </div>
+          <footer class="footer">${esc(r.trading_name||'Sotoboats')} · ${esc(r.business_email||'')} ${r.business_phone?`· ${esc(r.business_phone)}`:''}</footer>
+        </section>
+      </main>
+      <script>
+      function copyText(value,button){
+        if(navigator.clipboard&&navigator.clipboard.writeText){
+          navigator.clipboard.writeText(value).then(function(){
+            if(button){const old=button.textContent;button.textContent='Copied';setTimeout(function(){button.textContent=old;},1200);}
+          });
+        }
+      }
+      </script>
+      </body></html>`);
+  }catch(err){
+    console.error('Public payment request failed:',err);
+    res.status(500).send('Payment request could not be loaded.');
+  }
+});
+
 app.get('/pay/:token',async(req,res)=>{
   try{
     const token=String(req.params.token||'').trim();
@@ -1113,6 +1253,245 @@ app.get('/pay/:token',async(req,res)=>{
 
 app.use(requireAuth);
 
+app.get('/payment-requests',async(req,res)=>{
+  const tenant=await getTenant();
+  const rows=(await pool.query(`
+    SELECT pr.*,i.invoice_number,i.outstanding_minor,
+           COALESCE(i.snapshot_contact_name,c.contact_name) AS invoice_contact_name
+    FROM payment_requests pr
+    LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
+    LEFT JOIN invoice_customers c ON c.id=i.customer_id
+    WHERE pr.tenant_id=$1
+    ORDER BY pr.created_at DESC
+    LIMIT 300
+  `,[tenant.id])).rows;
+
+  const awaiting=rows.filter(r=>r.status==='awaiting').length;
+  const paid=rows.filter(r=>r.status==='paid').length;
+  const requested=rows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+  const collected=rows.filter(r=>r.status==='paid').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Customer</th><th>For</th><th>Amount</th><th>Status</th><th>Shared</th><th>Linked invoice</th><th></th></tr></thead><tbody>${rows.map(r=>{
+    const url=paymentRequestPageUrl(r);
+    const ref=paymentRequestReference(r);
+    const phone=cleanPhoneForWhatsApp(r.customer_phone);
+    const message=`Hi ${r.customer_name||''}, here is your Sotoboats payment request for ${euro(r.amount_minor)} (${ref}): ${url}`;
+    const wa=phone?`https://wa.me/${phone}?text=${encodeURIComponent(message)}`:`https://wa.me/?text=${encodeURIComponent(message)}`;
+    const status=r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>';
+    const share=r.share_count>0?`${Number(r.share_count)} · ${fmtDate(r.shared_at)}${r.last_shared_channel?` · ${esc(r.last_shared_channel)}`:''}`:'Not shared';
+    return `<tr>
+      <td><strong>${esc(ref)}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td>
+      <td><strong>${esc(r.customer_name||'')}</strong>${r.customer_phone?`<br><span class="muted">${esc(r.customer_phone)}</span>`:''}</td>
+      <td>${esc(r.purpose||'')}</td>
+      <td><strong>${euro(r.amount_minor)}</strong></td>
+      <td>${status}</td>
+      <td><span class="muted">${share}</span></td>
+      <td>${r.invoice_number?`<a href="/invoices/${r.invoice_id}">${esc(r.invoice_number)}</a>`:'—'}</td>
+      <td><div class="actions">
+        <button class="btn light" type="button" onclick="copyPaymentRequest('${r.id}','${esc(url)}',this)">Copy link</button>
+        <a class="btn light" target="_blank" href="${esc(wa)}" onclick="recordPaymentShare('${r.id}','whatsapp')">WhatsApp</a>
+        <a class="btn light" target="_blank" href="${esc(url)}">Open</a>
+        ${r.status==='awaiting'?`<form method="post" action="/payment-requests/${r.id}/paid" onsubmit="return confirm('Mark ${esc(ref)} as paid?');"><input name="reference" placeholder="Wise reference (optional)"><button class="btn gold">Mark paid</button></form><form method="post" action="/payment-requests/${r.id}/cancel" onsubmit="return confirm('Cancel this payment request?');"><button class="btn light">Cancel</button></form>`:''}
+      </div></td>
+    </tr>`;
+  }).join('')}</tbody></table></div>`:'<p class="sub">No payment requests yet.</p>';
+
+  const content=`<div class="metrics">
+    <div class="metric"><small>Awaiting</small><strong>${awaiting}</strong></div>
+    <div class="metric"><small>Paid requests</small><strong>${paid}</strong></div>
+    <div class="metric"><small>Requested</small><strong>${euro(requested)}</strong></div>
+    <div class="metric"><small>Collected</small><strong>${euro(collected)}</strong></div>
+  </div>
+  <section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:14px">
+      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Create a Sotoboats-branded payment link, send it on the spot and keep a record of what was shared.</p></div>
+      <a class="btn gold" href="/payment-requests/new">+ New payment request</a>
+    </div>
+    ${table}
+  </section>
+  <script>
+  function recordPaymentShare(id,channel){
+    try{
+      fetch('/payment-requests/'+id+'/shared',{
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'channel='+encodeURIComponent(channel),
+        keepalive:true
+      });
+    }catch(_){}
+  }
+  function copyPaymentRequest(id,url,button){
+    recordPaymentShare(id,'copy');
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(url).then(function(){
+        const old=button.textContent;button.textContent='Copied';setTimeout(function(){button.textContent=old;},1200);
+      });
+    }
+  }
+  </script>`;
+  res.send(shell('Payment Requests','payment-requests',content,'Quick Sotoboats payment links using the approved Wise bank account.'));
+});
+
+app.get('/payment-requests/new',async(req,res)=>{
+  const tenant=await getTenant();
+  const invoiceId=String(req.query.invoice_id||'').trim();
+  const invoices=(await pool.query(`
+    SELECT i.id,i.invoice_number,i.outstanding_minor,i.amount_due_now_minor,i.service_title,
+           COALESCE(i.snapshot_contact_name,c.contact_name) AS contact_name,
+           COALESCE(i.snapshot_phone,c.phone) AS phone,
+           COALESCE(i.snapshot_email,c.email) AS email
+    FROM customer_invoices i
+    JOIN invoice_customers c ON c.id=i.customer_id
+    WHERE i.tenant_id=$1 AND i.locked_at IS NOT NULL AND i.outstanding_minor>0
+    ORDER BY COALESCE(i.due_date,i.issue_date) ASC,i.created_at DESC
+  `,[tenant.id])).rows;
+  const selected=invoices.find(i=>String(i.id)===invoiceId)||null;
+  const defaultAmount=selected?Math.min(Number(selected.outstanding_minor||0),Math.max(0,Number(selected.amount_due_now_minor||selected.outstanding_minor||0))):0;
+  const options=['<option value="">No invoice — standalone payment request</option>'].concat(invoices.map(i=>`<option value="${i.id}" ${selected&&selected.id===i.id?'selected':''}>${esc(i.invoice_number||'Invoice')} · ${esc(i.contact_name||'')} · ${euro(i.outstanding_minor)} outstanding</option>`)).join('');
+
+  const content=`<section class="form-card">
+    <div class="actions" style="justify-content:space-between"><div><h2>New payment request</h2><p class="sub">Create the link while you are with the customer, then copy it or send it by WhatsApp.</p></div><a class="btn light" href="/payment-requests">Back</a></div>
+    <form method="post" action="/payment-requests">
+      <div class="form-grid">
+        <label>Customer name<input name="customer_name" value="${esc(selected?.contact_name||'')}" required></label>
+        <label>Customer phone<input name="customer_phone" value="${esc(selected?.phone||'')}" placeholder="+34..."></label>
+        <label>Customer email<input type="email" name="customer_email" value="${esc(selected?.email||'')}"></label>
+        <label>Amount €<input type="number" min="0.01" step="0.01" name="amount" value="${defaultAmount?major(defaultAmount).toFixed(2):''}" required></label>
+        <label class="full">What is this payment for?<input name="purpose" value="${esc(selected?.service_title||'')}" placeholder="e.g. Catamaran deposit, charter balance, boat delivery" required></label>
+        <label class="full">Link to invoice (optional)<select name="invoice_id">${options}</select></label>
+      </div>
+      <div class="notice" style="margin-top:12px"><strong>Payment destination</strong><br>${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'Wise')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</div>
+      <div class="actions" style="margin-top:14px"><button class="btn gold">Create payment request</button></div>
+    </form>
+  </section>`;
+  res.send(shell('New Payment Request','payment-requests',content,'A tracked Sotoboats link that pays into Dave’s approved Wise account.'));
+});
+
+app.post('/payment-requests',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const b=req.body;
+    const customerName=String(b.customer_name||'').trim();
+    const purpose=String(b.purpose||'').trim();
+    const amount=minor(b.amount);
+    const invoiceId=String(b.invoice_id||'').trim()||null;
+    if(!customerName) throw new Error('Customer name is required.');
+    if(!purpose) throw new Error('Enter what the payment is for.');
+    if(amount<=0) throw new Error('Enter a payment amount.');
+
+    if(invoiceId){
+      const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[invoiceId,tenant.id])).rows[0];
+      if(!i || !i.locked_at) throw new Error('Linked invoice could not be found.');
+      if(amount>Number(i.outstanding_minor||0)) throw new Error(`The payment request cannot exceed the invoice balance of ${euro(i.outstanding_minor)}.`);
+    }
+
+    const token=crypto.randomBytes(24).toString('base64url');
+    const inserted=(await client.query(`
+      INSERT INTO payment_requests(
+        tenant_id,invoice_id,customer_name,customer_phone,customer_email,purpose,amount_minor,
+        currency_code,status,public_token,created_by
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,'EUR','awaiting',$8,'Sotoboats Admin')
+      RETURNING *
+    `,[tenant.id,invoiceId,customerName,String(b.customer_phone||'').trim()||null,String(b.customer_email||'').trim()||null,purpose,amount,token])).rows[0];
+
+    if(invoiceId){
+      await client.query(`
+        INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+        VALUES($1,$2,'payment_request_created','Sotoboats Admin',
+          jsonb_build_object('payment_request_id',to_jsonb($3::text),'amount_minor',to_jsonb($4::bigint)))
+      `,[tenant.id,invoiceId,String(inserted.id),amount]);
+    }
+
+    await client.query('COMMIT');
+    res.redirect(`/payment-requests?created=${encodeURIComponent(paymentRequestReference(inserted))}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    res.status(400).send(shell('Payment request error','payment-requests',`<section class="card"><h2>Could not create payment request</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="javascript:history.back()">Go back</a></section>`));
+  }finally{client.release();}
+});
+
+app.post('/payment-requests/:id/shared',async(req,res)=>{
+  const tenant=await getTenant();
+  const channel=String(req.body.channel||'share').trim().slice(0,40)||'share';
+  const updated=(await pool.query(`
+    UPDATE payment_requests
+    SET shared_at=now(),share_count=share_count+1,last_shared_channel=$1,updated_at=now()
+    WHERE id=$2 AND tenant_id=$3
+    RETURNING id
+  `,[channel,req.params.id,tenant.id])).rows[0];
+  if(!updated) return res.status(404).json({ok:false,error:'Payment request not found'});
+  res.json({ok:true});
+});
+
+app.post('/payment-requests/:id/cancel',async(req,res)=>{
+  const tenant=await getTenant();
+  const updated=(await pool.query(`
+    UPDATE payment_requests
+    SET status='cancelled',cancelled_at=now(),updated_at=now()
+    WHERE id=$1 AND tenant_id=$2 AND status='awaiting'
+    RETURNING *
+  `,[req.params.id,tenant.id])).rows[0];
+  if(!updated) return res.status(400).send(shell('Payment request','payment-requests',`<section class="card"><h2>Could not cancel payment request</h2><p class="sub">It may already be paid or cancelled.</p><a class="btn light" href="/payment-requests">Back</a></section>`));
+  res.redirect('/payment-requests');
+});
+
+app.post('/payment-requests/:id/paid',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const r=(await client.query(`SELECT * FROM payment_requests WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];
+    if(!r) throw new Error('Payment request not found.');
+    if(r.status!=='awaiting') throw new Error('Only an awaiting payment request can be marked paid.');
+
+    let invoicePaymentId=null;
+    const paidReference=String(req.body.reference||'').trim()||paymentRequestReference(r);
+
+    if(r.invoice_id){
+      const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[r.invoice_id,tenant.id])).rows[0];
+      if(!i) throw new Error('Linked invoice could not be found.');
+      const amount=Number(r.amount_minor||0);
+      if(amount>Number(i.outstanding_minor||0)) throw new Error(`The invoice now has only ${euro(i.outstanding_minor)} outstanding. Update the payment before recording it.`);
+
+      invoicePaymentId=(await client.query(`
+        INSERT INTO customer_invoice_payments(tenant_id,invoice_id,amount_minor,currency_code,method,reference,paid_at)
+        VALUES($1,$2,$3,'EUR','wise',$4,now())
+        RETURNING id
+      `,[tenant.id,i.id,amount,paidReference])).rows[0].id;
+
+      const paid=Number(i.paid_minor||0)+amount;
+      const outstanding=Math.max(0,Number(i.total_minor||0)-paid-Number(i.credited_minor||0));
+      const status=outstanding===0?'paid':'part_paid';
+      await client.query(`
+        UPDATE customer_invoices
+        SET paid_minor=$1,outstanding_minor=$2,status=$3,
+            amount_due_now_minor=LEAST(COALESCE(amount_due_now_minor,$2),$2),updated_at=now()
+        WHERE id=$4
+      `,[paid,outstanding,status,i.id]);
+      await client.query(`
+        INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+        VALUES($1,$2,'payment_recorded','Sotoboats Admin',
+          jsonb_build_object('amount_minor',to_jsonb($3::bigint),'method','wise','payment_request_id',to_jsonb($4::text)))
+      `,[tenant.id,i.id,amount,String(r.id)]);
+    }
+
+    await client.query(`
+      UPDATE payment_requests
+      SET status='paid',paid_at=now(),paid_reference=$1,invoice_payment_id=$2,updated_at=now()
+      WHERE id=$3
+    `,[paidReference,invoicePaymentId,r.id]);
+
+    await client.query('COMMIT');
+    res.redirect('/payment-requests');
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    res.status(400).send(shell('Payment request error','payment-requests',`<section class="card"><h2>Could not mark payment as paid</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/payment-requests">Back</a></section>`));
+  }finally{client.release();}
+});
+
+
 app.get('/google/connect',async(req,res)=>{
   try{
     if(!googleOAuthConfigured())throw new Error('Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI in Render first.');
@@ -1182,7 +1561,7 @@ app.get('/', async (req,res)=>{
     pool.query(`SELECT i.*,c.contact_name,c.company_name FROM customer_invoices i JOIN invoice_customers c ON c.id=i.customer_id WHERE i.tenant_id=$1 ORDER BY i.created_at DESC LIMIT 8`,[tenant.id])
   ]);
   const table=recent.rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Total</th><th>Due now</th><th>Status</th><th></th></tr></thead><tbody>${recent.rows.map(r=>`<tr><td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td><td>${esc(r.company_name||r.contact_name)}</td><td>${euro(r.total_minor)}</td><td>${euro(r.amount_due_now_minor??r.outstanding_minor)}</td><td>${statusPill(r.status)}</td><td><a class="btn light" href="/invoices/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No invoices yet.</p>';
-  const content=`<div class="metrics"><div class="metric"><small>Invoices</small><strong>${counts.rows[0].n}</strong></div><div class="metric"><small>Invoiced</small><strong>${euro(total.rows[0].n)}</strong></div><div class="metric"><small>Paid</small><strong>${euro(paid.rows[0].n)}</strong></div><div class="metric"><small>Outstanding</small><strong>${euro(outstanding.rows[0].n)}</strong></div></div><section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Recent invoices</h2><a class="btn gold" href="/invoices/new">Create invoice</a></div>${table}</section>`;
+  const content=`<div class="metrics"><div class="metric"><small>Invoices</small><strong>${counts.rows[0].n}</strong></div><div class="metric"><small>Invoiced</small><strong>${euro(total.rows[0].n)}</strong></div><div class="metric"><small>Paid</small><strong>${euro(paid.rows[0].n)}</strong></div><div class="metric"><small>Outstanding</small><strong>${euro(outstanding.rows[0].n)}</strong></div></div><section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Recent invoices</h2><div class="actions"><a class="btn light" href="/payment-requests/new">New payment request</a><a class="btn gold" href="/invoices/new">Create invoice</a></div></div>${table}</section>`;
   res.send(shell('Invoice Dashboard','dashboard',content,'Dave’s live test of the future YDP invoicing engine.'));
 });
 
@@ -1993,7 +2372,7 @@ function invoicePreview(data){
   const vatGroups={}; items.forEach(x=>{const k=Number(x.tax_rate).toFixed(0);vatGroups[k]=(vatGroups[k]||0)+Number(x.line_tax_minor)});
   const identity=i.identity_number?`<p>${esc(i.identity_type||'ID')}: ${esc(i.identity_number)}</p>`:'';
   const rows=items.map(x=>`<tr><td><strong>${showEn?esc(x.description_en):esc(x.description_es||x.description_en)}</strong>${showEn&&x.detail_en?`<br><span class="muted">${esc(x.detail_en)}</span>`:''}${showEs&&x.description_es?`<br><span class="muted">${esc(x.description_es)}</span>`:''}${showEs&&x.detail_es?`<br><span class="muted">${esc(x.detail_es)}</span>`:''}</td><td>${Number(x.quantity)}</td><td>${euro(x.unit_price_minor)}</td><td>${Number(x.tax_rate).toFixed(0)}%</td><td>${euro(x.line_total_minor)}</td></tr>`).join('');
-  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div>${Number(i.credited_minor||0)>0?`<div class="summary-row"><span>Credit notes</span><strong>-${euro(i.credited_minor)}</strong></div>`:''}<div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${Number(i.paid_minor||0)+Number(i.credited_minor||0)>Number(i.total_minor||0)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Customer credit / refund due</span><strong>${euro(Number(i.paid_minor)+Number(i.credited_minor)-Number(i.total_minor))}</strong></div>`:''}${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</p>`:''}</div>`:''}</div>`;
+  return `<div class="invoice-sheet" id="invoiceSheet"><div class="invoice-head"><div class="invoice-brand"><img src="/sotoboats-logo.png" alt="Sotoboats" style="display:block;width:215px;max-width:100%;height:auto;margin:0 0 10px"><p><strong>${esc(tenant.legal_name)}</strong></p><p>${esc(tenant.address_1||'')} · ${esc(tenant.postcode||'')} ${esc(tenant.city||'')}</p><p>${esc(tenant.region||'')} · ${esc(tenant.country_name||'')}</p><p>${esc(tenant.email||'')} · ${esc(tenant.phone||'')}</p><p>Company ID: ${esc(tenant.tax_id||'')}</p></div><div class="invoice-meta"><strong>Invoice / Factura ${esc(i.invoice_number||'DRAFT')}</strong><p>Issue date / Fecha: ${fmtDate(i.issue_date)}</p><p>Due date / Vencimiento: ${fmtDate(i.due_date)}</p>${i.booking_reference?`<p>Booking ref: ${esc(i.booking_reference)}</p>`:''}</div></div><div class="billto"><div><div class="eyebrow">Bill to / Facturar a</div><p><strong>${esc(i.company_name||i.contact_name)}</strong></p>${i.company_name?`<p>${esc(i.contact_name)}</p>`:''}<p>${esc([i.billing_address_1,i.billing_address_2,i.billing_city,i.billing_region,i.billing_postcode].filter(Boolean).join(', '))}</p>${identity}</div><div><div class="eyebrow">Customer / Cliente</div><p>${esc(i.email||'')}</p><p>${esc(i.phone||'')}</p>${i.tax_number?`<p>Tax ID: ${esc(i.tax_number)}</p>`:''}</div></div><h3 class="invoice-title">${esc(i.service_title||'Invoice')}${i.service_start_date?` | ${fmtDate(i.service_start_date)}${i.service_end_date?` to ${fmtDate(i.service_end_date)}`:''}`:''}</h3><table class="invoice-table"><thead><tr><th>Product or Service</th><th>Qty</th><th>Net</th><th>VAT</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div class="invoice-summary"><div class="summary-row"><span>Subtotal</span><strong>${euro(i.subtotal_minor)}</strong></div>${Object.entries(vatGroups).sort((a,b)=>Number(a[0])-Number(b[0])).map(([rate,amt])=>`<div class="summary-row"><span>IVA / VAT ${rate}%</span><strong>${euro(amt)}</strong></div>`).join('')}<div class="summary-row"><span>Tax total</span><strong>${euro(i.tax_minor)}</strong></div><div class="summary-row"><span>Invoice total</span><strong>${euro(i.total_minor)}</strong></div><div class="summary-row"><span>Amount paid</span><strong>${euro(i.paid_minor)}</strong></div>${Number(i.credited_minor||0)>0?`<div class="summary-row"><span>Credit notes</span><strong>-${euro(i.credited_minor)}</strong></div>`:''}<div class="summary-row final"><span>Balance due</span><strong>${euro(i.outstanding_minor)}</strong></div>${Number(i.paid_minor||0)+Number(i.credited_minor||0)>Number(i.total_minor||0)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Customer credit / refund due</span><strong>${euro(Number(i.paid_minor)+Number(i.credited_minor)-Number(i.total_minor))}</strong></div>`:''}${i.amount_due_now_minor!=null&&Number(i.amount_due_now_minor)<Number(i.outstanding_minor)?`<div class="summary-row" style="margin-top:7px;background:#f6efe3;border-radius:8px"><span>Amount due now</span><strong>${euro(i.amount_due_now_minor)}</strong></div>`:''}</div>${i.customer_notes?`<div class="lang-block"><strong>Notes</strong><br>${esc(i.customer_notes)}</div>`:''}${showEn?`<div class="lang-block"><strong>English</strong><p>${esc(tenant.english_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Bank transfer:</strong> ${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}${tenant.bank_address?` · ${esc(tenant.bank_address)}`:''}</p>`:''}</div>`:''}${showEs?`<div class="lang-block"><strong>Español</strong><p>${esc(tenant.spanish_footer||'')}</p>${i.bank_transfer_enabled?`<p><strong>Transferencia bancaria:</strong> ${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}${tenant.bank_address?` · ${esc(tenant.bank_address)}`:''}</p>`:''}</div>`:''}</div>`;
 }
 
 
@@ -2025,9 +2404,10 @@ function invoiceEmailHtml(data) {
   const due = fmtDate(i.due_date);
   const name = esc(i.contact_name || i.company_name || 'Customer');
   const invoiceNo = esc(i.invoice_number || '');
-  const paymentUrl = i.wise_payment_url ? customerPaymentPageUrl(i) : '';
-  const paymentBlock = paymentUrl && Number(i.outstanding_minor)>0
-    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">Pay securely</a></p><p style="font-size:12px;color:#72838d">You will see the Sotoboats payment page first, then continue securely to Wise.</p>`
+  const activeRequest=latestAwaitingPaymentRequest(data);
+  const paymentUrl=activeRequest?paymentRequestPageUrl(activeRequest):'';
+  const paymentBlock=paymentUrl&&Number(i.outstanding_minor)>0
+    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">View payment request</a></p><p style="font-size:12px;color:#72838d">Open the Sotoboats payment page for the Wise bank details and your payment reference.</p>`
     : '<p>Payment details are included on the attached invoice.</p>';
   return `<!doctype html>
   <html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
@@ -2059,9 +2439,10 @@ function paymentReminderHtml(data) {
   const {tenant,invoice:i}=data;
   const overdue=i.due_date && dateYmd(i.due_date) < new Date().toISOString().slice(0,10);
   const name=esc(i.contact_name||i.company_name||'Customer');
-  const paymentUrl=i.wise_payment_url?customerPaymentPageUrl(i):'';
+  const activeRequest=latestAwaitingPaymentRequest(data);
+  const paymentUrl=activeRequest?paymentRequestPageUrl(activeRequest):'';
   const paymentBlock=paymentUrl&&Number(i.outstanding_minor)>0
-    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">Pay securely</a></p><p style="font-size:12px;color:#72838d">You will see the Sotoboats payment page first, then continue securely to Wise.</p>`
+    ? `<p style="margin:20px 0"><a href="${esc(paymentUrl)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:700;padding:13px 20px;border-radius:9px">View payment request</a></p><p style="font-size:12px;color:#72838d">Open the Sotoboats payment page for the Wise bank details and your payment reference.</p>`
     : '<p>If payment has already been made, please disregard this message. Otherwise, the payment details are included on the attached invoice.</p>';
   return `<!doctype html><html><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#183247">
   <div style="max-width:650px;margin:0 auto;padding:28px 16px">
@@ -2186,7 +2567,7 @@ function buildInvoicePdfBuffer(data) {
       doc.fillColor(muted).font('Helvetica').fontSize(7).text(tenant.english_footer||'',45,y,{width:505}); y+=55;
       if(i.bank_transfer_enabled){
         doc.fillColor(navy).font('Helvetica-Bold').text(
-          `Bank transfer: ${tenant.bank_account_name||''} · IBAN ${tenant.bank_iban||''} · BIC ${tenant.bank_bic||''}`,
+          `Bank transfer: ${tenant.bank_account_name||''} · ${tenant.bank_name||''} · IBAN ${tenant.bank_iban||''} · BIC ${tenant.bank_bic||''}${tenant.bank_address?` · ${tenant.bank_address}`:''}`,
           45,y,{width:505}
         );
         y+=25;
@@ -2219,21 +2600,19 @@ app.get('/invoices/:id',async(req,res)=>{
   const reminderBtn=i.locked_at&&i.email&&Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/remind" onsubmit="return confirm('Send a friendly payment reminder to ${esc(i.email)}?');"><button class="btn light">Send reminder</button></form>`:'';
   const creditBtn=i.locked_at&&remainingCredit>0?`<a class="btn light" href="/invoices/${i.id}/credit-note">Create credit note</a>`:'';
 
-  const customerPayUrl=i.wise_payment_url?customerPaymentPageUrl(i,req):'';
-  const suggestedWiseAmount=Math.min(
-    Number(i.outstanding_minor||0),
-    Math.max(0,Number(i.wise_payment_amount_minor||i.amount_due_now_minor||i.outstanding_minor||0))
-  );
-  const wisePayment=i.locked_at?`<section class="card no-print">
-    <div class="section-head"><div><h2>Wise payment request</h2><p class="sub">Create the payment request in Dave's approved Wise account, then paste the Wise link here. The customer receives a Sotoboats-branded page first.</p></div></div>
-    ${Number(i.outstanding_minor)>0?`<form method="post" action="/invoices/${i.id}/wise-link">
-      <div class="form-grid">
-        <label>Amount requested €<input type="number" name="amount" min="0.01" max="${major(i.outstanding_minor).toFixed(2)}" step="0.01" value="${major(suggestedWiseAmount).toFixed(2)}" required></label>
-        <label>Wise payment request URL<input type="url" name="wise_payment_url" value="${esc(i.wise_payment_url||'')}" placeholder="https://..." required></label>
-      </div>
-      <div class="actions" style="margin-top:12px"><button class="btn gold">Save Wise payment link</button>${i.wise_payment_url?`<button class="btn light" name="remove_wise_link" value="1" formnovalidate>Remove link</button>`:''}</div>
-    </form>`:'<p class="sub"><strong>This invoice is fully paid.</strong> No new Wise request is needed.</p>'}
-    ${customerPayUrl?`<div class="notice" style="margin-top:14px"><strong>Customer payment page</strong><p class="sub" style="margin:5px 0 8px">Share this Sotoboats link with the customer — not the raw Wise URL.</p><div class="actions"><input id="customerPayLink" value="${esc(customerPayUrl)}" readonly style="min-width:min(100%,520px);flex:1"><button class="btn light" type="button" onclick="navigator.clipboard.writeText(document.getElementById('customerPayLink').value);this.textContent='Copied';">Copy link</button><a class="btn light" target="_blank" href="${esc(customerPayUrl)}">Open page</a></div></div>`:''}
+  const linkedPaymentRequests=data.payment_requests||[];
+  const paymentRequestRows=linkedPaymentRequests.length?linkedPaymentRequests.map(r=>{
+    const ref=paymentRequestReference(r);
+    const url=paymentRequestPageUrl(r,req);
+    const status=r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>';
+    return `<tr><td><strong>${esc(ref)}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td><td>${euro(r.amount_minor)}</td><td>${status}</td><td>${Number(r.share_count||0)} share${Number(r.share_count||0)===1?'':'s'}</td><td><a class="btn light" target="_blank" href="${esc(url)}">Open</a></td></tr>`;
+  }).join(''):'';
+  const paymentRequestPanel=i.locked_at?`<section class="card no-print">
+    <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Tracked Sotoboats payment links using the approved Wise bank account.</p></div>
+      ${Number(i.outstanding_minor)>0?`<a class="btn gold" href="/payment-requests/new?invoice_id=${i.id}">Create payment request</a>`:''}
+    </div>
+    ${linkedPaymentRequests.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Amount</th><th>Status</th><th>Shared</th><th></th></tr></thead><tbody>${paymentRequestRows}</tbody></table></div>`:'<p class="sub">No payment request has been created for this invoice yet.</p>'}
   </section>`:'';
 
   const controls=`<div class="actions no-print" style="margin-bottom:15px">${!i.locked_at?`<a class="btn light" href="/invoices/${i.id}/edit">Edit draft</a><form method="post" action="/invoices/${i.id}/issue" onsubmit="return confirm('Issue this invoice? Once issued, its financial content will be locked.');"><button class="btn gold">Issue invoice</button></form>`:`<a class="btn light" target="_blank" href="/invoices/${i.id}/pdf">Download PDF</a><button class="btn light" onclick="window.print()">Print</button>${emailBtn}${reminderBtn}${creditBtn}`}${i.emailed_at?`<span class="pill green">Emailed ${fmtDate(i.emailed_at)} to ${esc(i.emailed_to||i.email||'')}</span>`:''}<a class="btn light" href="/invoices">Back to invoices</a></div>`;
@@ -2244,7 +2623,7 @@ app.get('/invoices/:id',async(req,res)=>{
 
   const audit=data.events.length?`<section class="card no-print"><h2>Audit trail</h2><div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>Actor</th></tr></thead><tbody>${data.events.map(e=>`<tr><td>${fmtDate(e.created_at)}</td><td>${esc(e.event_type.replaceAll('_',' '))}</td><td>${esc(e.actor_name||'System')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
 
-  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${wisePayment}${payment}${credits}${audit}`,i.locked_at?'Issued invoices are locked. Payments and credit notes can still be recorded.':'This is a draft and can still be edited.'));
+  res.send(shell(i.invoice_number||'Draft Invoice','invoices',`${controls}${invoicePreview(data)}${paymentRequestPanel}${payment}${credits}${audit}`,i.locked_at?'Issued invoices are locked. Payments and credit notes can still be recorded.':'This is a draft and can still be edited.'));
 });
 
 app.post('/invoices/:id/issue',async(req,res)=>{
@@ -2418,7 +2797,7 @@ app.post('/invoices/:id/email',async(req,res)=>{
       replyTo:tenant.email || undefined,
       subject,
       html:invoiceEmailHtml(data),
-      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nPlease find attached Sotoboats invoice ${i.invoice_number}.\nBalance due: ${euro(i.outstanding_minor)}\nDue date: ${fmtDate(i.due_date)}\n\n${i.wise_payment_url?`Pay securely via the Sotoboats payment page: ${customerPaymentPageUrl(i)}`:'Payment details are included on the attached invoice.'}\n\nThank you,\nSotoboats`,
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nPlease find attached Sotoboats invoice ${i.invoice_number}.\nBalance due: ${euro(i.outstanding_minor)}\nDue date: ${fmtDate(i.due_date)}\n\n${latestAwaitingPaymentRequest(data)?`Payment request: ${paymentRequestPageUrl(latestAwaitingPaymentRequest(data))}`:'Payment details are included on the attached invoice.'}\n\nThank you,\nSotoboats`,
       attachments:[{
         filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
         content:pdf,
@@ -2468,7 +2847,7 @@ app.post('/invoices/:id/remind',async(req,res)=>{
       replyTo:tenant.email||undefined,
       subject:`Friendly payment reminder – Sotoboats Invoice ${i.invoice_number}`,
       html:paymentReminderHtml(data),
-      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nJust a friendly reminder that ${euro(i.outstanding_minor)} remains outstanding on Sotoboats invoice ${i.invoice_number}, due ${fmtDate(i.due_date)}.\n\nIf payment has already been made, please disregard this message.${i.wise_payment_url?`\n\nPay securely via the Sotoboats payment page: ${customerPaymentPageUrl(i)}`:' Otherwise, the payment details are included on the attached invoice.'}\n\nMany thanks,\nSotoboats`,
+      text:`Hello ${i.contact_name||i.company_name||'Customer'},\n\nJust a friendly reminder that ${euro(i.outstanding_minor)} remains outstanding on Sotoboats invoice ${i.invoice_number}, due ${fmtDate(i.due_date)}.\n\nIf payment has already been made, please disregard this message.${latestAwaitingPaymentRequest(data)?`\n\nPayment request: ${paymentRequestPageUrl(latestAwaitingPaymentRequest(data))}`:' Otherwise, the payment details are included on the attached invoice.'}\n\nMany thanks,\nSotoboats`,
       attachments:[{
         filename:`Sotoboats-Invoice-${i.invoice_number}.pdf`,
         content:pdf,
@@ -3091,12 +3470,12 @@ app.get('/month-end/accountant-pack.zip',(req,res)=>{
 
 app.get('/settings',async(req,res)=>{
   const t=await getTenant();
-  const content=`<section class="form-card"><h2>Company & invoice settings</h2><form method="post" action="/settings"><div class="form-grid"><label>Trading name<input name="trading_name" value="${esc(t.trading_name)}" required></label><label>Legal entity<input name="legal_name" value="${esc(t.legal_name)}" required></label><label>Company / VAT ID<input name="tax_id" value="${esc(t.tax_id||'')}"></label><label>Invoice contact email<input type="email" name="email" value="${esc(t.email||'')}"></label><label>Phone<input name="phone" value="${esc(t.phone||'')}"></label><label>Website<input name="website" value="${esc(t.website||'')}"></label><label>Address<input name="address_1" value="${esc(t.address_1||'')}"></label><label>Postcode<input name="postcode" value="${esc(t.postcode||'')}"></label><label>City<input name="city" value="${esc(t.city||'')}"></label><label>Region<input name="region" value="${esc(t.region||'')}"></label><label>Invoice prefix<input name="invoice_prefix" value="${esc(t.invoice_prefix||'')}" placeholder="Blank keeps 0001575 style"></label><label>Next invoice number<input type="number" min="1" name="next_invoice_number" value="${Number(t.next_invoice_number)}"></label><label>Payment terms days<input type="number" min="0" name="payment_terms_days" value="${Number(t.payment_terms_days)}"></label><label>Default language<select name="default_language"><option value="bilingual" ${t.default_language==='bilingual'?'selected':''}>Bilingual</option><option value="en" ${t.default_language==='en'?'selected':''}>English</option><option value="es" ${t.default_language==='es'?'selected':''}>Spanish</option></select></label><label>Deposit %<input type="number" step="0.01" min="0" max="100" name="deposit_percent" value="${Number(t.deposit_percent)}"></label><label>Deposit threshold days<input type="number" min="0" name="deposit_threshold_days" value="${Number(t.deposit_threshold_days)}"></label><label>Bank account name<input name="bank_account_name" value="${esc(t.bank_account_name||'')}"></label><label>Bank name<input name="bank_name" value="${esc(t.bank_name||'')}"></label><label>IBAN<input name="bank_iban" value="${esc(t.bank_iban||'')}"></label><label>BIC / SWIFT<input name="bank_bic" value="${esc(t.bank_bic||'')}"></label><label class="full">English footer<textarea name="english_footer">${esc(t.english_footer||'')}</textarea></label><label class="full">Spanish footer<textarea name="spanish_footer">${esc(t.spanish_footer||'')}</textarea></label></div><div class="notice" style="margin-top:12px">The next invoice number is seeded at <strong>0001575</strong> to follow the current invoice #0001574. Change this only if Dave confirms a different active series.</div><div class="actions" style="margin-top:14px"><button class="btn gold">Save settings</button></div></form></section>`;
+  const content=`<section class="form-card"><h2>Company & invoice settings</h2><form method="post" action="/settings"><div class="form-grid"><label>Trading name<input name="trading_name" value="${esc(t.trading_name)}" required></label><label>Legal entity<input name="legal_name" value="${esc(t.legal_name)}" required></label><label>Company / VAT ID<input name="tax_id" value="${esc(t.tax_id||'')}"></label><label>Invoice contact email<input type="email" name="email" value="${esc(t.email||'')}"></label><label>Phone<input name="phone" value="${esc(t.phone||'')}"></label><label>Website<input name="website" value="${esc(t.website||'')}"></label><label>Address<input name="address_1" value="${esc(t.address_1||'')}"></label><label>Postcode<input name="postcode" value="${esc(t.postcode||'')}"></label><label>City<input name="city" value="${esc(t.city||'')}"></label><label>Region<input name="region" value="${esc(t.region||'')}"></label><label>Invoice prefix<input name="invoice_prefix" value="${esc(t.invoice_prefix||'')}" placeholder="Blank keeps 0001575 style"></label><label>Next invoice number<input type="number" min="1" name="next_invoice_number" value="${Number(t.next_invoice_number)}"></label><label>Payment terms days<input type="number" min="0" name="payment_terms_days" value="${Number(t.payment_terms_days)}"></label><label>Default language<select name="default_language"><option value="bilingual" ${t.default_language==='bilingual'?'selected':''}>Bilingual</option><option value="en" ${t.default_language==='en'?'selected':''}>English</option><option value="es" ${t.default_language==='es'?'selected':''}>Spanish</option></select></label><label>Deposit %<input type="number" step="0.01" min="0" max="100" name="deposit_percent" value="${Number(t.deposit_percent)}"></label><label>Deposit threshold days<input type="number" min="0" name="deposit_threshold_days" value="${Number(t.deposit_threshold_days)}"></label><label>Bank account name<input name="bank_account_name" value="${esc(t.bank_account_name||'')}"></label><label>Bank name<input name="bank_name" value="${esc(t.bank_name||'')}"></label><label>IBAN<input name="bank_iban" value="${esc(t.bank_iban||'')}"></label><label>BIC / SWIFT<input name="bank_bic" value="${esc(t.bank_bic||'')}"></label><label class="full">Bank address<input name="bank_address" value="${esc(t.bank_address||'')}"></label><label class="full">English footer<textarea name="english_footer">${esc(t.english_footer||'')}</textarea></label><label class="full">Spanish footer<textarea name="spanish_footer">${esc(t.spanish_footer||'')}</textarea></label></div><div class="notice" style="margin-top:12px">The next invoice number is seeded at <strong>0001575</strong> to follow the current invoice #0001574. Change this only if Dave confirms a different active series.</div><div class="actions" style="margin-top:14px"><button class="btn gold">Save settings</button></div></form></section>`;
   res.send(shell('Company Settings','settings',content,'Legal entity, trading name, numbering, deposit rules and bank details.'));
 });
 app.post('/settings',async(req,res)=>{
   const t=await getTenant();const b=req.body;
-  await pool.query(`UPDATE invoice_tenants SET trading_name=$1,legal_name=$2,tax_id=$3,email=$4,phone=$5,website=$6,address_1=$7,postcode=$8,city=$9,region=$10,invoice_prefix=$11,next_invoice_number=$12,payment_terms_days=$13,default_language=$14,deposit_percent=$15,deposit_threshold_days=$16,bank_account_name=$17,bank_name=$18,bank_iban=$19,bank_bic=$20,english_footer=$21,spanish_footer=$22,updated_at=now() WHERE id=$23`,[b.trading_name,b.legal_name,b.tax_id||null,b.email||null,b.phone||null,b.website||null,b.address_1||null,b.postcode||null,b.city||null,b.region||null,b.invoice_prefix||'',Number(b.next_invoice_number||1),Number(b.payment_terms_days||0),b.default_language||'bilingual',Number(b.deposit_percent||0),Number(b.deposit_threshold_days||0),b.bank_account_name||null,b.bank_name||null,b.bank_iban||null,b.bank_bic||null,b.english_footer||null,b.spanish_footer||null,t.id]);
+  await pool.query(`UPDATE invoice_tenants SET trading_name=$1,legal_name=$2,tax_id=$3,email=$4,phone=$5,website=$6,address_1=$7,postcode=$8,city=$9,region=$10,invoice_prefix=$11,next_invoice_number=$12,payment_terms_days=$13,default_language=$14,deposit_percent=$15,deposit_threshold_days=$16,bank_account_name=$17,bank_name=$18,bank_iban=$19,bank_bic=$20,bank_address=$21,english_footer=$22,spanish_footer=$23,updated_at=now() WHERE id=$24`,[b.trading_name,b.legal_name,b.tax_id||null,b.email||null,b.phone||null,b.website||null,b.address_1||null,b.postcode||null,b.city||null,b.region||null,b.invoice_prefix||'',Number(b.next_invoice_number||1),Number(b.payment_terms_days||0),b.default_language||'bilingual',Number(b.deposit_percent||0),Number(b.deposit_threshold_days||0),b.bank_account_name||null,b.bank_name||null,b.bank_iban||null,b.bank_bic||null,b.bank_address||null,b.english_footer||null,b.spanish_footer||null,t.id]);
   res.redirect('/settings');
 });
 
@@ -3151,7 +3530,55 @@ async function initialiseDatabase() {
       ADD COLUMN IF NOT EXISTS credit_note_padding INTEGER NOT NULL DEFAULT 6,
       ADD COLUMN IF NOT EXISTS next_credit_note_number INTEGER NOT NULL DEFAULT 1,
       ADD COLUMN IF NOT EXISTS google_drive_refresh_token_enc TEXT,
-      ADD COLUMN IF NOT EXISTS google_drive_connected_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS google_drive_connected_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS bank_address TEXT;
+  `);
+
+  await pool.query(`
+    UPDATE invoice_tenants
+    SET bank_account_name='David Barry Knowles Knowles',
+        bank_name='Wise',
+        bank_iban='BE89 9052 7577 8885',
+        bank_bic='TRWIBEB1XXX',
+        bank_address='Wise, Rue du Trône 100, 3rd floor, Brussels, 1050, Belgium',
+        updated_at=now()
+    WHERE code='SOTOBOATS'
+      AND (
+        bank_iban IS NULL
+        OR TRIM(bank_iban)=''
+        OR REPLACE(bank_iban,' ','')='ES0621006848150200185240'
+      );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payment_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
+      request_number BIGSERIAL UNIQUE,
+      invoice_id UUID REFERENCES customer_invoices(id) ON DELETE SET NULL,
+      customer_name TEXT NOT NULL,
+      customer_phone TEXT,
+      customer_email TEXT,
+      purpose TEXT NOT NULL,
+      amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+      currency_code CHAR(3) NOT NULL DEFAULT 'EUR',
+      status TEXT NOT NULL DEFAULT 'awaiting' CHECK (status IN ('awaiting','paid','cancelled')),
+      public_token TEXT NOT NULL UNIQUE,
+      created_by TEXT,
+      shared_at TIMESTAMPTZ,
+      share_count INTEGER NOT NULL DEFAULT 0,
+      last_shared_channel TEXT,
+      paid_at TIMESTAMPTZ,
+      paid_reference TEXT,
+      invoice_payment_id UUID REFERENCES customer_invoice_payments(id) ON DELETE SET NULL,
+      cancelled_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_payment_requests_tenant_status
+      ON payment_requests(tenant_id,status,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice
+      ON payment_requests(invoice_id,created_at DESC);
   `);
 
   await pool.query(`
