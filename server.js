@@ -1136,34 +1136,103 @@ function pwaHeadTags() {
 function pwaClientScript() {
   return `<script>
   (function(){
-    let installPrompt=null;
+    let deferredInstallPrompt=null;
+
     function installButton(){return document.getElementById('pwaInstallButton');}
-    window.addEventListener('beforeinstallprompt',function(e){
-      e.preventDefault();
-      installPrompt=e;
+    function installStatus(){return document.getElementById('pwaInstallStatus');}
+    function setStatus(message){
+      const s=installStatus();
+      if(s) s.textContent=message||'';
+    }
+    function isStandalone(){
+      return window.matchMedia('(display-mode: standalone)').matches
+        || window.navigator.standalone===true;
+    }
+    function supportsModernInstall(){
+      return typeof navigator.install==='function';
+    }
+    function refreshInstallButton(){
       const b=installButton();
-      if(b) b.hidden=false;
+      if(!b) return;
+      if(isStandalone()){
+        b.hidden=true;
+        setStatus('');
+        return;
+      }
+      b.hidden=!(supportsModernInstall() || deferredInstallPrompt);
+    }
+
+    window.addEventListener('beforeinstallprompt',function(event){
+      event.preventDefault();
+      deferredInstallPrompt=event;
+      refreshInstallButton();
     });
+
     window.installSotoboatsApp=async function(){
-      if(!installPrompt) return;
-      installPrompt.prompt();
-      try{await installPrompt.userChoice;}catch(_){}
-      installPrompt=null;
       const b=installButton();
-      if(b) b.hidden=true;
+      if(!b || isStandalone()) return;
+
+      b.setAttribute('aria-disabled','true');
+      setStatus('Opening the install prompt…');
+
+      try{
+        if(supportsModernInstall()){
+          await navigator.install();
+          setStatus('Sotoboats has been installed or opened.');
+          b.hidden=true;
+          return;
+        }
+
+        if(deferredInstallPrompt){
+          const promptEvent=deferredInstallPrompt;
+          deferredInstallPrompt=null;
+          await promptEvent.prompt();
+          const choice=await promptEvent.userChoice;
+          if(choice && choice.outcome==='accepted'){
+            setStatus('Sotoboats has been installed.');
+            b.hidden=true;
+          }else{
+            setStatus('Installation was cancelled. You can try again from the browser install icon.');
+            refreshInstallButton();
+          }
+          return;
+        }
+
+        setStatus('Use the install icon in the browser address bar, or the browser menu → Install app.');
+      }catch(error){
+        console.error('Sotoboats install failed',error);
+        if(error && error.name==='AbortError'){
+          setStatus('Installation was cancelled or could not complete. You can try again.');
+        }else if(error && error.name==='DataError'){
+          setStatus('Chrome found a problem with the app installation data. Refresh once and try again.');
+        }else{
+          setStatus('The browser could not start installation. Use the install icon in the address bar.');
+        }
+      }finally{
+        b.removeAttribute('aria-disabled');
+      }
     };
+
     window.addEventListener('appinstalled',function(){
-      installPrompt=null;
+      deferredInstallPrompt=null;
       const b=installButton();
       if(b) b.hidden=true;
+      setStatus('Sotoboats has been installed.');
     });
+
     if('serviceWorker' in navigator){
       window.addEventListener('load',function(){
-        navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(err){
-          console.warn('Sotoboats service worker could not register',err);
-        });
+        navigator.serviceWorker.register('/sw.js',{scope:'/'})
+          .then(function(){ refreshInstallButton(); })
+          .catch(function(err){
+            console.warn('Sotoboats service worker could not register',err);
+            setStatus('App installation is unavailable until the page is refreshed.');
+          });
       });
     }
+
+    document.addEventListener('DOMContentLoaded',refreshInstallButton);
+    refreshInstallButton();
   })();
   <\/script>`;
 }
@@ -1181,7 +1250,7 @@ const nav = (active) => `
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
-    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-bottom:10px">Install app</button><a href="/logout">Sign out →</a></div>
+    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-bottom:7px">Install app</button><div id="pwaInstallStatus" style="font-size:10px;line-height:1.35;margin:0 0 10px;color:#9fb0ba"></div><a href="/logout">Sign out →</a></div>
   </aside>`;
 
 function shell(title, active, content, subtitle='') {
@@ -1223,7 +1292,7 @@ function shell(title, active, content, subtitle='') {
 
 app.get('/login',(req,res)=>{
   if(req.session?.sotoboatsInvoiceAuthed) return res.redirect('/');
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title>${pwaHeadTags()}<link rel="stylesheet" href="/styles.css"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-top:10px">Install Sotoboats app</button></form>${pwaClientScript()}</body></html>`);
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title>${pwaHeadTags()}<link rel="stylesheet" href="/styles.css"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-top:10px">Install Sotoboats app</button><div id="pwaInstallStatus" style="font-size:11px;line-height:1.4;margin-top:8px;color:#667783"></div></form>${pwaClientScript()}</body></html>`);
 });
 app.post('/login',(req,res)=>{
   const email = process.env.ADMIN_EMAIL || 'admin@example.com';
