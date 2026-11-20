@@ -2949,7 +2949,7 @@ app.get('/', async (req,res)=>{
   const table=recent.rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Total</th><th>Due now</th><th>Status</th><th></th></tr></thead><tbody>${recent.rows.map(r=>`<tr><td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td><td>${esc(r.company_name||r.contact_name)}</td><td>${euro(r.total_minor)}</td><td>${euro(r.amount_due_now_minor??r.outstanding_minor)}</td><td>${statusPill(r.status)}</td><td><a class="btn light" href="/invoices/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No invoices yet.</p>';
 
   const content=`
-    <div class="metrics" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+    <div class="metrics" style="grid-template-columns:repeat(2,minmax(0,1fr))">
       <a class="metric" href="/bookings?filter=upcoming">
         <small>Upcoming · next 30 days</small>
         <strong>${Number(bk.upcoming||0)}</strong>
