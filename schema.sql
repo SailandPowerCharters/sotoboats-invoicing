@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS booking_intakes (
   contact_email text,
   contact_phone text,
   service_title text NOT NULL,
+  duration_text text,
   service_start_date date,
   service_end_date date,
   agreed_price_minor bigint NOT NULL CHECK (agreed_price_minor > 0),
@@ -208,6 +209,9 @@ CREATE INDEX IF NOT EXISTS idx_booking_intakes_tenant_status
   ON booking_intakes(tenant_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_booking_intakes_customer
   ON booking_intakes(customer_id,created_at DESC);
+
+ALTER TABLE booking_intakes
+  ADD COLUMN IF NOT EXISTS duration_text text;
 
 ALTER TABLE customer_invoices
   ADD COLUMN IF NOT EXISTS booking_intake_id uuid REFERENCES booking_intakes(id) ON DELETE SET NULL;
