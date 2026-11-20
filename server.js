@@ -1339,7 +1339,7 @@ const nav = (active) => `
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
-    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-bottom:7px">Install app</button><div id="pwaInstallStatus" style="font-size:10px;line-height:1.35;margin:0 0 10px;color:#9fb0ba"></div><a href="/logout">Sign out →</a></div>
+    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><a href="/logout">Sign out →</a></div>
   </aside>`;
 
 function shell(title, active, content, subtitle='') {
@@ -1347,8 +1347,8 @@ function shell(title, active, content, subtitle='') {
   <title>${esc(title)} | Sotoboats Invoicing</title>
   ${pwaHeadTags()}
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=1">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=2">
   <style>
     .line-row{align-items:end}
     .line-row .preset-bar{
@@ -1381,7 +1381,7 @@ function shell(title, active, content, subtitle='') {
 
 app.get('/login',(req,res)=>{
   if(req.session?.sotoboatsInvoiceAuthed) return res.redirect('/');
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title>${pwaHeadTags()}<link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=1"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-top:10px">Install Sotoboats app</button><div id="pwaInstallStatus" style="font-size:11px;line-height:1.4;margin-top:8px;color:#667783"></div></form>${pwaClientScript()}</body></html>`);
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title>${pwaHeadTags()}<link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=2"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button></form>${pwaClientScript()}</body></html>`);
 });
 app.post('/login',(req,res)=>{
   const email = process.env.ADMIN_EMAIL || 'admin@example.com';
@@ -1397,7 +1397,7 @@ app.get('/logout',(req,res)=>req.session.destroy(()=>res.redirect('/login')));
 app.get('/gestor-login',(req,res)=>{
   if(req.session?.sotoboatsGestorAuthed) return res.redirect('/gestor-portal');
   const configured=!!(String(process.env.GESTOR_EMAIL||'').trim() && String(process.env.GESTOR_PASSWORD||'').trim());
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Login</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=1"></head><body class="login-page"><form class="login-card" method="post" action="/gestor-login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Gestor Portal</h1><p class="sub">Marbella Sailing School S.L. · Read-only finance access</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}${!configured?'<div class="error">Gestor login is not configured yet. Add GESTOR_EMAIL and GESTOR_PASSWORD in Render.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter Gestor Portal →</button><p class="sub" style="margin-top:14px"><a href="/login">Sotoboats admin login</a></p></form></body></html>`);
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Login</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=2"></head><body class="login-page"><form class="login-card" method="post" action="/gestor-login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Gestor Portal</h1><p class="sub">Marbella Sailing School S.L. · Read-only finance access</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}${!configured?'<div class="error">Gestor login is not configured yet. Add GESTOR_EMAIL and GESTOR_PASSWORD in Render.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter Gestor Portal →</button><p class="sub" style="margin-top:14px"><a href="/login">Sotoboats admin login</a></p></form></body></html>`);
 });
 
 app.post('/gestor-login',(req,res)=>{
@@ -1436,7 +1436,7 @@ app.get('/gestor-portal',requireGestorAuth,async(req,res)=>{
 
   const expenseTable=expenses.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Supplier</th><th>Document</th><th>Category</th><th>Net</th><th>VAT</th><th>Total</th><th></th></tr></thead><tbody>${expenses.map(e=>`<tr><td>${fmtDate(e.expense_date)}</td><td>${esc(e.supplier_name||'—')}</td><td>${esc(e.document_number||e.source_file_name||'—')}</td><td>${esc(e.category||'—')}</td><td>${euro(e.net_minor)}</td><td>${euro(e.tax_minor)}</td><td><strong>${euro(e.total_minor)}</strong></td><td>${(e.source_drive_url||e.source_file_path)?`<a class="btn light" target="_blank" href="/gestor/expenses/${e.id}/file">Document</a>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No expenses captured in this month.</p>';
 
-  const page=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Portal</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=1"><style>
+  const page=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Gestor Portal</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/mobile.css?v=2"><style>
     body{background:#f4f7f9;color:#0b1d2f}.gestor-wrap{max-width:1500px;margin:0 auto;padding:28px}.gestor-head{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:20px}.gestor-brand{display:flex;align-items:center;gap:14px}.gestor-mark{width:42px;height:42px;border-radius:50%;border:1px solid #caa86d;display:grid;place-items:center;color:#caa86d;font-family:Georgia,serif;font-size:22px}.gestor-title h1{margin:0;font-family:Georgia,serif;font-size:34px}.gestor-title p{margin:3px 0 0;color:#667783}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:18px 0}.metric{background:white;border:1px solid #dce3e6;border-radius:12px;padding:16px}.metric small{display:block;color:#667783;margin-bottom:6px}.metric strong{font-size:22px}.card{background:#fff;border:1px solid #dce3e6;border-radius:14px;padding:18px;margin-bottom:16px}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.btn{display:inline-block;border:1px solid #d5dde2;border-radius:9px;padding:10px 14px;background:white;color:#0b1d2f;text-decoration:none;font-weight:700;font-size:13px;cursor:pointer}.btn.gold{background:#caa86d;border-color:#caa86d}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1px solid #e4e9ec;text-align:left;font-size:13px}th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#667783}.sub{color:#667783}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.section-head h2{margin:0;font-family:Georgia,serif}@media(max-width:900px){.metrics{grid-template-columns:1fr 1fr}.gestor-head{align-items:flex-start;flex-direction:column}}@media(max-width:600px){.gestor-wrap{padding:15px}.metrics{grid-template-columns:1fr}.gestor-title h1{font-size:28px}}
   </style></head><body><div class="gestor-wrap">
     <header class="gestor-head"><div class="gestor-brand"><div class="gestor-mark">S</div><div class="gestor-title"><div style="font-size:11px;letter-spacing:.14em;color:#b28747;font-weight:700">SOTOBOATS</div><h1>Gestor Portal</h1><p>Marbella Sailing School S.L. · Read-only finance access</p></div></div><div class="actions"><a class="btn" href="/gestor-logout">Log out</a></div></header>
@@ -2946,7 +2946,17 @@ app.get('/', async (req,res)=>{
   const ik=invoiceKpis.rows[0];
   const pk=paymentKpis.rows[0];
 
-  const table=recent.rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Total</th><th>Due now</th><th>Status</th><th></th></tr></thead><tbody>${recent.rows.map(r=>`<tr><td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td><td>${esc(r.company_name||r.contact_name)}</td><td>${euro(r.total_minor)}</td><td>${euro(r.amount_due_now_minor??r.outstanding_minor)}</td><td>${statusPill(r.status)}</td><td><a class="btn light" href="/invoices/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No invoices yet.</p>';
+  const table=recent.rows.length?`<div class="recent-invoice-list">${recent.rows.map(r=>`<a class="recent-invoice-row" href="/invoices/${r.id}">
+    <div class="recent-invoice-main">
+      <strong>${esc(r.invoice_number||'Draft')} · ${esc(r.company_name||r.contact_name)}</strong>
+      <span>${fmtDate(r.created_at)}</span>
+    </div>
+    <div class="recent-invoice-money">
+      <small>Due now</small>
+      <strong>${euro(r.amount_due_now_minor??r.outstanding_minor)}</strong>
+    </div>
+    <div class="recent-invoice-status">${statusPill(r.status)}</div>
+  </a>`).join('')}</div>`:'<p class="sub">No invoices yet.</p>';
 
   const content=`
     <div class="metrics" style="grid-template-columns:repeat(2,minmax(0,1fr))">
@@ -2977,16 +2987,16 @@ app.get('/', async (req,res)=>{
     </div>
 
     <section class="card">
-      <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div class="dashboard-section-head">
         <div>
           <h2 style="margin:0">Recent invoices</h2>
-          <p class="sub" style="margin:4px 0 0"><a href="/month-end?month=${encodeURIComponent(currentMonth)}">View this month's Gestor / payment summary →</a></p>
+          <p class="sub" style="margin:4px 0 0"><a href="/month-end?month=${encodeURIComponent(currentMonth)}">This month's payment summary →</a></p>
         </div>
-        <div class="actions">
-          <a class="btn light" href="/bookings/new">New booking</a>
-          <a class="btn light" href="/payment-requests/new">New payment request</a>
-          <a class="btn gold" href="/invoices/new">Create invoice</a>
-        </div>
+      </div>
+      <div class="dashboard-quick-actions">
+        <a class="btn light" href="/bookings/new">+ Booking</a>
+        <a class="btn light" href="/payment-requests/new">+ Payment request</a>
+        <a class="btn gold" href="/invoices/new">+ Invoice</a>
       </div>
       ${table}
     </section>`;
