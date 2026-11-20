@@ -2061,7 +2061,8 @@ app.get('/client-details/:token',async(req,res)=>{
         <div class="body">
           <div class="summary">
             <div><span>Booking for</span><strong>${esc(b.contact_name||'')}</strong></div>
-            <div><span>Service</span><strong>${esc(b.service_title||'')}</strong></div>
+            <div><span>Description</span><strong>${esc(b.service_title||'')}</strong></div>
+            <div><span>Duration</span><strong>${esc(b.duration_text||'—')}</strong></div>
             ${b.service_start_date?`<div><span>Date</span><strong>${fmtDate(b.service_start_date)}</strong></div>`:''}
             <div><span>Booking value</span><strong>${euro(b.agreed_price_minor)}</strong></div>
           </div>
@@ -2205,7 +2206,8 @@ app.get('/bookings/new',async(req,res)=>{
         <label>Client name<input name="contact_name" required></label>
         <label>Email<input type="email" name="contact_email"></label>
         <label>Mobile<input name="contact_phone" placeholder="+34..."></label>
-        <label class="full">Service / booking<input name="service_title" placeholder="e.g. Catamaran charter" required></label>
+        <label>Description<select name="service_title" required><option value="">Choose charter type</option><option value="Catamaran Charter">Catamaran Charter</option><option value="Motor Yacht Charter">Motor Yacht Charter</option></select></label>
+        <label>Duration<input name="duration_text" placeholder="e.g. 2 hours" required></label>
         <label>Start date<input type="date" name="service_start_date"></label>
         <label>End date<input type="date" name="service_end_date"></label>
         <label>Agreed price €<input type="number" min="0.01" step="0.01" name="agreed_price" required></label>
@@ -2238,22 +2240,24 @@ app.post('/bookings',async(req,res)=>{
     const email=String(b.contact_email||'').trim();
     const phone=String(b.contact_phone||'').trim();
     const service=String(b.service_title||'').trim();
+    const duration=String(b.duration_text||'').trim();
+    const allowedServices=['Catamaran Charter','Motor Yacht Charter'];
     const agreed=minor(b.agreed_price);
     const channel=['email','whatsapp','sms'].includes(String(b.request_channel||''))?String(b.request_channel):'email';
-    if(!name || !service || agreed<=0) throw new Error('Client name, service and agreed price are required.');
+    if(!name || !allowedServices.includes(service) || !duration || agreed<=0) throw new Error('Client name, description, duration and agreed price are required.');
     if(channel==='email' && !email) throw new Error('Add the client email address or choose WhatsApp / SMS.');
     if(['whatsapp','sms'].includes(channel) && !phone) throw new Error('Add the client mobile number or choose Email.');
 
     const token=crypto.randomBytes(24).toString('base64url');
     const row=(await pool.query(`
       INSERT INTO booking_intakes(
-        tenant_id,public_token,status,contact_name,contact_email,contact_phone,service_title,
+        tenant_id,public_token,status,contact_name,contact_email,contact_phone,service_title,duration_text,
         service_start_date,service_end_date,agreed_price_minor,price_includes_vat,tax_rate,
         payment_mode,custom_amount_due_minor,internal_notes,request_channel,created_by
-      ) VALUES($1,$2,'agreed',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'Sotoboats Admin')
+      ) VALUES($1,$2,'agreed',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'Sotoboats Admin')
       RETURNING *
     `,[
-      tenant.id,token,name,email||null,phone||null,service,b.service_start_date||null,b.service_end_date||null,
+      tenant.id,token,name,email||null,phone||null,service,duration,b.service_start_date||null,b.service_end_date||null,
       agreed,b.price_includes_vat!=='0',Number(b.tax_rate||21),b.payment_mode||'auto',
       b.payment_mode==='custom'?minor(b.custom_amount_due):null,String(b.internal_notes||'').trim()||null,channel
     ])).rows[0];
@@ -2326,6 +2330,8 @@ app.get('/bookings/:id',async(req,res)=>{
     <div class="table-wrap" style="margin-top:14px"><table><tbody>
       <tr><th>Client</th><td>${esc(b.contact_name||'')}</td></tr>
       <tr><th>Contact</th><td>${esc([b.contact_email,b.contact_phone].filter(Boolean).join(' · ')||'—')}</td></tr>
+      <tr><th>Description</th><td>${esc(b.service_title||'—')}</td></tr>
+      <tr><th>Duration</th><td>${esc(b.duration_text||'—')}</td></tr>
       <tr><th>Service date</th><td>${b.service_start_date?fmtDate(b.service_start_date):'—'}</td></tr>
       <tr><th>Agreed price</th><td><strong>${euro(b.agreed_price_minor)}</strong> · ${b.price_includes_vat?'IVA included':'plus IVA'} · ${Number(b.tax_rate||0)}%</td></tr>
       <tr><th>Payment plan</th><td>${esc(String(b.payment_mode||'auto').replaceAll('_',' '))}</td></tr>
@@ -2487,10 +2493,10 @@ app.post('/bookings/:id/approve',async(req,res)=>{
 
     await client.query(`
       INSERT INTO customer_invoice_items(
-        invoice_id,sort_order,description_en,description_es,quantity,unit_price_minor,tax_rate,
+        invoice_id,sort_order,description_en,description_es,detail_en,detail_es,quantity,unit_price_minor,tax_rate,
         line_net_minor,line_tax_minor,line_total_minor
-      ) VALUES($1,0,$2,$2,1,$3,$4,$3,$5,$6)
-    `,[invoice.id,b.service_title,net,rate,vat,total]);
+      ) VALUES($1,0,$2,$2,$3,$3,1,$4,$5,$4,$6,$7)
+    `,[invoice.id,b.service_title,b.duration_text?`Duration: ${b.duration_text}`:null,net,rate,vat,total]);
 
     await client.query(`
       INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
