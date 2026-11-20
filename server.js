@@ -2154,7 +2154,7 @@ app.use(requireAuth);
 
 app.get('/bookings',async(req,res)=>{
   const tenant=await getTenant();
-  const rows=(await pool.query(`
+  const allRows=(await pool.query(`
     SELECT bi.*,i.invoice_number
     FROM booking_intakes bi
     LEFT JOIN customer_invoices i ON i.id=bi.invoice_id
@@ -2163,10 +2163,38 @@ app.get('/bookings',async(req,res)=>{
     LIMIT 400
   `,[tenant.id])).rows;
 
-  const awaiting=rows.filter(r=>['agreed','details_requested'].includes(r.status)).length;
-  const ready=rows.filter(r=>r.status==='details_received').length;
-  const invoiceReady=rows.filter(r=>['invoice_ready','invoiced'].includes(r.status)).length;
-  const total=rows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.agreed_price_minor||0),0);
+  const filter=String(req.query.filter||'all');
+  const today=new Date();
+  today.setHours(0,0,0,0);
+  const in30=new Date(today.getTime()+(30*86400000));
+
+  const isUpcoming=(r)=>{
+    if(r.status==='cancelled' || !r.service_start_date) return false;
+    const ymd=dateYmd(r.service_start_date);
+    if(!ymd) return false;
+    const d=new Date(`${ymd}T00:00:00`);
+    return d>=today && d<=in30;
+  };
+
+  let rows=allRows;
+  if(filter==='upcoming') rows=allRows.filter(isUpcoming);
+  if(filter==='waiting') rows=allRows.filter(r=>['agreed','details_requested'].includes(r.status));
+  if(filter==='ready') rows=allRows.filter(r=>r.status==='details_received');
+  if(filter==='invoice_ready') rows=allRows.filter(r=>['invoice_ready','invoiced'].includes(r.status));
+
+  const awaiting=allRows.filter(r=>['agreed','details_requested'].includes(r.status)).length;
+  const ready=allRows.filter(r=>r.status==='details_received').length;
+  const invoiceReady=allRows.filter(r=>['invoice_ready','invoiced'].includes(r.status)).length;
+  const upcoming=allRows.filter(isUpcoming).length;
+  const total=allRows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.agreed_price_minor||0),0);
+
+  const bookingFilters=[
+    ['all','All',allRows.length],
+    ['upcoming','Upcoming 30 days',upcoming],
+    ['waiting','Waiting for details',awaiting],
+    ['ready','Ready to review',ready],
+    ['invoice_ready','Invoice ready / issued',invoiceReady]
+  ].map(([key,label,count])=>`<a class="btn ${filter===key?'gold':'light'}" href="/bookings?filter=${key}">${label} (${count})</a>`).join('');
 
   const table=rows.length?`<div class="table-wrap"><table>
     <thead><tr><th>Booking</th><th>Client</th><th>Service</th><th>Date</th><th>Value</th><th>Status</th><th></th></tr></thead>
@@ -2192,6 +2220,7 @@ app.get('/bookings',async(req,res)=>{
         <div><h2 style="margin:0">Bookings</h2><p class="sub" style="margin:4px 0 0">Dave enters the booking. The client supplies the invoicing details.</p></div>
         <a class="btn gold" href="/bookings/new">+ New booking</a>
       </div>
+      <div class="actions" style="margin-bottom:14px">${bookingFilters}</div>
       ${table}
     </section>`;
   res.send(shell('Bookings','bookings',content,'Booking agreed → client details requested → invoice ready.'));
@@ -2522,7 +2551,7 @@ app.post('/bookings/:id/approve',async(req,res)=>{
 
 app.get('/payment-requests',async(req,res)=>{
   const tenant=await getTenant();
-  const rows=(await pool.query(`
+  const allRows=(await pool.query(`
     SELECT pr.*,i.invoice_number,i.outstanding_minor,
            COALESCE(i.snapshot_contact_name,c.contact_name) AS invoice_contact_name
     FROM payment_requests pr
@@ -2533,10 +2562,22 @@ app.get('/payment-requests',async(req,res)=>{
     LIMIT 300
   `,[tenant.id])).rows;
 
-  const awaiting=rows.filter(r=>r.status==='awaiting').length;
-  const paid=rows.filter(r=>r.status==='paid').length;
-  const requested=rows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.amount_minor||0),0);
-  const collected=rows.filter(r=>r.status==='paid').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+  const filter=String(req.query.filter||'all');
+  let rows=allRows;
+  if(['awaiting','paid','cancelled'].includes(filter)) rows=allRows.filter(r=>r.status===filter);
+
+  const awaiting=allRows.filter(r=>r.status==='awaiting').length;
+  const paid=allRows.filter(r=>r.status==='paid').length;
+  const cancelled=allRows.filter(r=>r.status==='cancelled').length;
+  const requested=allRows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+  const collected=allRows.filter(r=>r.status==='paid').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+
+  const paymentFilters=[
+    ['all','All',allRows.length],
+    ['awaiting','Awaiting',awaiting],
+    ['paid','Paid',paid],
+    ['cancelled','Cancelled',cancelled]
+  ].map(([key,label,count])=>`<a class="btn ${filter===key?'gold':'light'}" href="/payment-requests?filter=${key}">${label} (${count})</a>`).join('');
 
   const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Customer</th><th>For</th><th>Amount</th><th>Status</th><th>Shared</th><th>Linked invoice</th><th></th></tr></thead><tbody>${rows.map(r=>{
     const url=paymentRequestPageUrl(r);
@@ -2575,6 +2616,7 @@ app.get('/payment-requests',async(req,res)=>{
       <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Create a Sotoboats-branded payment link, take card payments through Stripe, send it on the spot and keep a record of what was shared.</p></div>
       <a class="btn gold" href="/payment-requests/new">+ New payment request</a>
     </div>
+    <div class="actions" style="margin-bottom:14px">${paymentFilters}</div>
     ${table}
   </section>
   <script>
@@ -2851,16 +2893,104 @@ app.post('/google/disconnect',async(req,res)=>{
 
 app.get('/', async (req,res)=>{
   const tenant=await getTenant();
-  const [counts,total,paid,outstanding,recent]=await Promise.all([
-    pool.query(`SELECT COUNT(*)::int n FROM customer_invoices WHERE tenant_id=$1`,[tenant.id]),
-    pool.query(`SELECT COALESCE(SUM(total_minor),0)::bigint n FROM customer_invoices WHERE tenant_id=$1 AND status<>'cancelled'`,[tenant.id]),
-    pool.query(`SELECT COALESCE(SUM(paid_minor),0)::bigint n FROM customer_invoices WHERE tenant_id=$1 AND status<>'cancelled'`,[tenant.id]),
-    pool.query(`SELECT COALESCE(SUM(outstanding_minor),0)::bigint n FROM customer_invoices WHERE tenant_id=$1 AND status IN ('sent','part_paid','overdue')`,[tenant.id]),
-    pool.query(`SELECT i.*,c.contact_name,c.company_name FROM customer_invoices i JOIN invoice_customers c ON c.id=i.customer_id WHERE i.tenant_id=$1 ORDER BY i.created_at DESC LIMIT 8`,[tenant.id])
+  await refreshOverdueStatuses(tenant.id);
+
+  const currentMonth=new Date().toISOString().slice(0,7);
+  const [bookingKpis,invoiceKpis,paymentKpis,recent]=await Promise.all([
+    pool.query(`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE status<>'cancelled'
+            AND service_start_date>=CURRENT_DATE
+            AND service_start_date<=CURRENT_DATE+INTERVAL '30 days'
+        )::int AS upcoming,
+        COUNT(*) FILTER (WHERE status IN ('agreed','details_requested'))::int AS waiting_details,
+        COUNT(*) FILTER (WHERE status='details_received')::int AS ready_review
+      FROM booking_intakes
+      WHERE tenant_id=$1
+    `,[tenant.id]),
+    pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE locked_at IS NULL)::int AS drafts,
+        COUNT(*) FILTER (
+          WHERE locked_at IS NOT NULL
+            AND outstanding_minor>0
+            AND due_date<CURRENT_DATE
+        )::int AS overdue_count,
+        COALESCE(SUM(outstanding_minor) FILTER (
+          WHERE locked_at IS NOT NULL
+            AND outstanding_minor>0
+            AND due_date<CURRENT_DATE
+        ),0)::bigint AS overdue_amount
+      FROM customer_invoices
+      WHERE tenant_id=$1
+    `,[tenant.id]),
+    pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status='awaiting')::int AS awaiting_count,
+        COALESCE(SUM(amount_minor) FILTER (WHERE status='awaiting'),0)::bigint AS awaiting_amount
+      FROM payment_requests
+      WHERE tenant_id=$1
+    `,[tenant.id]),
+    pool.query(`
+      SELECT i.*,c.contact_name,c.company_name
+      FROM customer_invoices i
+      JOIN invoice_customers c ON c.id=i.customer_id
+      WHERE i.tenant_id=$1
+      ORDER BY i.created_at DESC
+      LIMIT 8
+    `,[tenant.id])
   ]);
+
+  const bk=bookingKpis.rows[0];
+  const ik=invoiceKpis.rows[0];
+  const pk=paymentKpis.rows[0];
+
   const table=recent.rows.length?`<div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Total</th><th>Due now</th><th>Status</th><th></th></tr></thead><tbody>${recent.rows.map(r=>`<tr><td><strong>${esc(r.invoice_number||'Draft')}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td><td>${esc(r.company_name||r.contact_name)}</td><td>${euro(r.total_minor)}</td><td>${euro(r.amount_due_now_minor??r.outstanding_minor)}</td><td>${statusPill(r.status)}</td><td><a class="btn light" href="/invoices/${r.id}">Open</a></td></tr>`).join('')}</tbody></table></div>`:'<p class="sub">No invoices yet.</p>';
-  const content=`<div class="metrics"><div class="metric"><small>Invoices</small><strong>${counts.rows[0].n}</strong></div><div class="metric"><small>Invoiced</small><strong>${euro(total.rows[0].n)}</strong></div><div class="metric"><small>Paid</small><strong>${euro(paid.rows[0].n)}</strong></div><div class="metric"><small>Outstanding</small><strong>${euro(outstanding.rows[0].n)}</strong></div></div><section class="card"><div class="actions" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Recent invoices</h2><div class="actions"><a class="btn light" href="/payment-requests/new">New payment request</a><a class="btn gold" href="/invoices/new">Create invoice</a></div></div>${table}</section>`;
-  res.send(shell('Invoice Dashboard','dashboard',content,'Dave’s live test of the future YDP invoicing engine.'));
+
+  const content=`
+    <div class="metrics" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      <a class="metric" href="/bookings?filter=upcoming">
+        <small>Upcoming · next 30 days</small>
+        <strong>${Number(bk.upcoming||0)}</strong>
+      </a>
+      <a class="metric" href="/bookings?filter=waiting">
+        <small>Waiting for client details</small>
+        <strong>${Number(bk.waiting_details||0)}</strong>
+      </a>
+      <a class="metric" href="/bookings?filter=ready">
+        <small>Ready to review</small>
+        <strong>${Number(bk.ready_review||0)}</strong>
+      </a>
+      <a class="metric" href="/invoices?filter=draft">
+        <small>Draft invoices</small>
+        <strong>${Number(ik.drafts||0)}</strong>
+      </a>
+      <a class="metric" href="/payment-requests?filter=awaiting">
+        <small>Awaiting payment · ${Number(pk.awaiting_count||0)} request${Number(pk.awaiting_count||0)===1?'':'s'}</small>
+        <strong>${euro(pk.awaiting_amount||0)}</strong>
+      </a>
+      <a class="metric" href="/invoices?filter=overdue">
+        <small>Overdue · ${Number(ik.overdue_count||0)} invoice${Number(ik.overdue_count||0)===1?'':'s'}</small>
+        <strong>${euro(ik.overdue_amount||0)}</strong>
+      </a>
+    </div>
+
+    <section class="card">
+      <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+        <div>
+          <h2 style="margin:0">Recent invoices</h2>
+          <p class="sub" style="margin:4px 0 0"><a href="/month-end?month=${encodeURIComponent(currentMonth)}">View this month's Gestor / payment summary →</a></p>
+        </div>
+        <div class="actions">
+          <a class="btn light" href="/bookings/new">New booking</a>
+          <a class="btn light" href="/payment-requests/new">New payment request</a>
+          <a class="btn gold" href="/invoices/new">Create invoice</a>
+        </div>
+      </div>
+      ${table}
+    </section>`;
+  res.send(shell('Dashboard','dashboard',content,'What needs attention now.'));
 });
 
 function customerForm(c={}, action='/customers', heading='New customer') {
