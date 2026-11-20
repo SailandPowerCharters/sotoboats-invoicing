@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS invoice_customers (
 );
 CREATE INDEX IF NOT EXISTS idx_invoice_customers_tenant ON invoice_customers(tenant_id);
 
+ALTER TABLE invoice_customers
+  ADD COLUMN IF NOT EXISTS identity_country_code char(2);
+
 CREATE TABLE IF NOT EXISTS customer_invoices (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
@@ -151,6 +154,66 @@ CREATE TABLE IF NOT EXISTS customer_invoice_events (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_customer_invoice_events_invoice ON customer_invoice_events(invoice_id, created_at);
+
+CREATE TABLE IF NOT EXISTS booking_intakes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
+  booking_number bigserial UNIQUE,
+  public_token text NOT NULL UNIQUE,
+  status text NOT NULL DEFAULT 'agreed'
+    CHECK (status IN ('agreed','details_requested','details_received','invoice_ready','invoiced','cancelled')),
+
+  contact_name text NOT NULL,
+  contact_email text,
+  contact_phone text,
+  service_title text NOT NULL,
+  service_start_date date,
+  service_end_date date,
+  agreed_price_minor bigint NOT NULL CHECK (agreed_price_minor > 0),
+  price_includes_vat boolean NOT NULL DEFAULT true,
+  tax_rate numeric(7,4) NOT NULL DEFAULT 21.0000,
+  payment_mode text NOT NULL DEFAULT 'auto' CHECK (payment_mode IN ('auto','full','deposit','custom')),
+  custom_amount_due_minor bigint,
+  internal_notes text,
+
+  request_channel text,
+  request_sent_at timestamptz,
+  request_sent_count integer NOT NULL DEFAULT 0,
+
+  submitted_customer_type text CHECK (submitted_customer_type IN ('individual','business')),
+  submitted_company_name text,
+  submitted_contact_name text,
+  submitted_email text,
+  submitted_phone text,
+  submitted_billing_address_1 text,
+  submitted_billing_address_2 text,
+  submitted_billing_city text,
+  submitted_billing_region text,
+  submitted_billing_postcode text,
+  submitted_billing_country_code char(2),
+  submitted_tax_number text,
+  submitted_identity_type text,
+  submitted_identity_number text,
+  submitted_identity_country_code char(2),
+  details_submitted_at timestamptz,
+
+  customer_id uuid REFERENCES invoice_customers(id) ON DELETE SET NULL,
+  invoice_id uuid REFERENCES customer_invoices(id) ON DELETE SET NULL,
+  approved_at timestamptz,
+  created_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_booking_intakes_tenant_status
+  ON booking_intakes(tenant_id,status,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_booking_intakes_customer
+  ON booking_intakes(customer_id,created_at DESC);
+
+ALTER TABLE customer_invoices
+  ADD COLUMN IF NOT EXISTS booking_intake_id uuid REFERENCES booking_intakes(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_invoices_booking_intake
+  ON customer_invoices(booking_intake_id)
+  WHERE booking_intake_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS payment_requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
