@@ -1121,6 +1121,53 @@ function monthEndExpensesCsv(rows, month) {
   return [header,...data].map(row=>row.map(csvEscape).join(',')).join('\\n');
 }
 
+function pwaHeadTags() {
+  return `<meta name="theme-color" content="#0b1d2f">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Sotoboats">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512.png">`;
+}
+
+function pwaClientScript() {
+  return `<script>
+  (function(){
+    let installPrompt=null;
+    function installButton(){return document.getElementById('pwaInstallButton');}
+    window.addEventListener('beforeinstallprompt',function(e){
+      e.preventDefault();
+      installPrompt=e;
+      const b=installButton();
+      if(b) b.hidden=false;
+    });
+    window.installSotoboatsApp=async function(){
+      if(!installPrompt) return;
+      installPrompt.prompt();
+      try{await installPrompt.userChoice;}catch(_){}
+      installPrompt=null;
+      const b=installButton();
+      if(b) b.hidden=true;
+    };
+    window.addEventListener('appinstalled',function(){
+      installPrompt=null;
+      const b=installButton();
+      if(b) b.hidden=true;
+    });
+    if('serviceWorker' in navigator){
+      window.addEventListener('load',function(){
+        navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(err){
+          console.warn('Sotoboats service worker could not register',err);
+        });
+      });
+    }
+  })();
+  <\/script>`;
+}
+
 const nav = (active) => `
   <aside class="side">
     <div class="brand"><span class="mark">S</span><div><strong>SOTOBOATS</strong><small>INVOICING · YDP PILOT</small></div></div>
@@ -1134,12 +1181,13 @@ const nav = (active) => `
       <a class="${active==='customers'?'active':''}" href="/customers">Customers</a>
       <a class="${active==='settings'?'active':''}" href="/settings">Company Settings</a>
     </nav>
-    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><a href="/logout">Sign out →</a></div>
+    <div class="side-foot">Marbella Sailing School S.L.<br>trading as Sotoboats<br><br><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-bottom:10px">Install app</button><a href="/logout">Sign out →</a></div>
   </aside>`;
 
 function shell(title, active, content, subtitle='') {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${esc(title)} | Sotoboats Invoicing</title>
+  ${pwaHeadTags()}
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
@@ -1170,12 +1218,12 @@ function shell(title, active, content, subtitle='') {
       .preset-bar.show-route label:first-child{grid-column:auto}
     }
   </style></head><body><div class="layout">${nav(active)}<main class="main">
-  <div class="top"><div><div class="eyebrow">Sotoboats · Your Dispatch Partner pilot</div><h1>${esc(title)}</h1>${subtitle?`<p class="sub">${esc(subtitle)}</p>`:''}</div></div>${content}</main></div></body></html>`;
+  <div class="top"><div><div class="eyebrow">Sotoboats · Your Dispatch Partner pilot</div><h1>${esc(title)}</h1>${subtitle?`<p class="sub">${esc(subtitle)}</p>`:''}</div></div>${content}</main></div>${pwaClientScript()}</body></html>`;
 }
 
 app.get('/login',(req,res)=>{
   if(req.session?.sotoboatsInvoiceAuthed) return res.redirect('/');
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title><link rel="stylesheet" href="/styles.css"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button></form></body></html>`);
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sotoboats Invoicing Login</title>${pwaHeadTags()}<link rel="stylesheet" href="/styles.css"></head><body class="login-page"><form class="login-card" method="post" action="/login"><span class="mark">S</span><div class="eyebrow">SOTOBOATS</div><h1>Invoicing</h1><p class="sub">Marbella Sailing School S.L. · YDP pilot</p>${req.query.error?'<div class="error">Login details were not recognised.</div>':''}<label>Email<input type="email" name="email" required></label><label>Password<input type="password" name="password" required></label><button class="btn gold" type="submit">Enter invoicing →</button><button id="pwaInstallButton" class="btn light" type="button" hidden onclick="installSotoboatsApp()" style="width:100%;margin-top:10px">Install Sotoboats app</button></form>${pwaClientScript()}</body></html>`);
 });
 app.post('/login',(req,res)=>{
   const email = process.env.ADMIN_EMAIL || 'admin@example.com';
