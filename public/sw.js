@@ -1,11 +1,11 @@
-const CACHE_NAME = 'sotoboats-static-v1';
+const CACHE_NAME = 'sotoboats-static-v2';
 const STATIC_ASSETS = [
   '/styles.css',
   '/sotoboats-logo.png',
   '/manifest.webmanifest',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
-  '/icons/apple-touch-icon.png',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/apple-touch-icon.png',
   '/offline.html'
 ];
 
@@ -32,7 +32,6 @@ self.addEventListener('fetch', event => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
-  // Never cache live application/navigation responses containing invoice or payment data.
   if (request.mode === 'navigate') {
     event.respondWith(fetch(request).catch(() => caches.match('/offline.html')));
     return;
