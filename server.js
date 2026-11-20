@@ -480,6 +480,94 @@ function cleanPhoneForWhatsApp(value) {
   return String(value||'').replace(/\D/g,'');
 }
 
+function bookingReference(booking) {
+  const n=Number(booking?.booking_number||0);
+  return n>0 ? `SBK-${String(n).padStart(6,'0')}` : 'Sotoboats booking';
+}
+
+function bookingDetailsUrl(booking, req=null) {
+  const token=String(booking?.public_token||'').trim();
+  if(!token) return '';
+  return `${publicAppBaseUrl(req)}/client-details/${encodeURIComponent(token)}`;
+}
+
+function bookingStatusBadge(status) {
+  const s=String(status||'agreed').toLowerCase();
+  const label={
+    agreed:'Booking agreed',
+    details_requested:'Details requested',
+    details_received:'Ready to review',
+    invoice_ready:'Invoice ready',
+    invoiced:'Invoiced',
+    cancelled:'Cancelled'
+  }[s] || s.replaceAll('_',' ');
+  const cls={
+    details_received:'green',
+    invoice_ready:'green',
+    invoiced:'green',
+    details_requested:'amber',
+    cancelled:'red'
+  }[s] || '';
+  return `<span class="pill ${cls}">${esc(label)}</span>`;
+}
+
+function bookingRequestMessage(booking, req=null) {
+  const ref=bookingReference(booking);
+  const url=bookingDetailsUrl(booking,req);
+  return `Hi ${booking.contact_name||''}, thank you for booking with Sotoboats. Please complete your secure invoicing details for ${ref} here: ${url}`;
+}
+
+function bookingRequestEmailHtml(tenant, booking, req=null) {
+  const ref=bookingReference(booking);
+  const url=bookingDetailsUrl(booking,req);
+  return `<!doctype html><html><body style="margin:0;background:#f3f6f7;font-family:Arial,sans-serif;color:#0b1d2f">
+    <div style="max-width:650px;margin:0 auto;padding:28px 16px">
+      <div style="background:#0b1d2f;padding:24px;border-radius:14px 14px 0 0">
+        <div style="color:#caa86d;font-size:12px;letter-spacing:.16em;font-weight:700">SOTOBOATS</div>
+        <div style="color:#fff;font-size:24px;font-weight:700;margin-top:5px">Your booking details</div>
+      </div>
+      <div style="background:#fff;padding:28px;border:1px solid #e1e7ea;border-top:0;border-radius:0 0 14px 14px">
+        <p style="margin-top:0">Hello ${esc(booking.contact_name||'')},</p>
+        <p>Thank you for booking with <strong>Sotoboats</strong>.</p>
+        <p>Before we prepare your invoice, please complete your invoicing details using the secure form below.</p>
+        <div style="background:#f7f3ea;border-radius:10px;padding:16px;margin:20px 0">
+          <div style="font-size:12px;color:#786849">Booking reference</div>
+          <div style="font-size:20px;font-weight:700;margin-top:3px">${esc(ref)}</div>
+          <div style="font-size:12px;color:#60727d;margin-top:7px">${esc(booking.service_title||'')}</div>
+        </div>
+        <p style="margin:22px 0"><a href="${esc(url)}" style="display:inline-block;background:#caa86d;color:#0b1d2f;text-decoration:none;font-weight:800;padding:14px 22px;border-radius:9px">Complete invoicing details</a></p>
+        <p style="font-size:12px;color:#6f7f87;line-height:1.6">We use these details only to manage your booking, invoicing and accounting records. We do not ask you to upload a passport image.</p>
+        <p style="margin-bottom:0">Many thanks,<br><strong>Sotoboats</strong></p>
+      </div>
+      <div style="text-align:center;color:#8998a0;font-size:11px;padding:16px">${esc(tenant.legal_name||'Marbella Sailing School S.L.')} · ${esc(tenant.email||'')}</div>
+    </div>
+  </body></html>`;
+}
+
+async function sendBookingDetailsEmail(tenant, booking, req=null) {
+  if(!String(booking.contact_email||'').trim()) throw new Error('This booking does not have an email address.');
+  const transporter=getMailTransporter();
+  const from=process.env.SMTP_FROM||tenant.email||process.env.SMTP_USER;
+  const text=bookingRequestMessage(booking,req);
+  await transporter.sendMail({
+    from,
+    to:booking.contact_email,
+    replyTo:tenant.email||undefined,
+    subject:`Sotoboats booking ${bookingReference(booking)} – invoicing details`,
+    html:bookingRequestEmailHtml(tenant,booking,req),
+    text:`Hello ${booking.contact_name||''},\n\nThank you for booking with Sotoboats.\n\nPlease complete your invoicing details here:\n${bookingDetailsUrl(booking,req)}\n\nBooking reference: ${bookingReference(booking)}\n${booking.service_title||''}\n\nMany thanks,\nSotoboats`
+  });
+  await pool.query(`
+    UPDATE booking_intakes
+    SET status=CASE WHEN status='agreed' THEN 'details_requested' ELSE status END,
+        request_channel='email',
+        request_sent_at=now(),
+        request_sent_count=COALESCE(request_sent_count,0)+1,
+        updated_at=now()
+    WHERE id=$1
+  `,[booking.id]);
+}
+
 function stripeMode() {
   return String(process.env.STRIPE_MODE||'test').trim().toLowerCase()==='live' ? 'live' : 'test';
 }
@@ -1242,6 +1330,7 @@ const nav = (active) => `
     <div class="brand"><span class="mark">S</span><div><strong>SOTOBOATS</strong><small>INVOICING · YDP PILOT</small></div></div>
     <nav>
       <a class="${active==='dashboard'?'active':''}" href="/">Dashboard</a>
+      <a class="${active==='bookings'?'active':''}" href="/bookings">Bookings</a>
       <a class="${active==='invoices'?'active':''}" href="/invoices">Invoices</a>
       <a class="${active==='payment-requests'?'active':''}" href="/payment-requests">Payment Requests</a>
       <a class="${active==='credit-notes'?'active':''}" href="/credit-notes">Credit Notes</a>
@@ -1859,7 +1948,571 @@ app.get('/pay/:token',async(req,res)=>{
   }
 });
 
+
+app.get('/client-details/:token',async(req,res)=>{
+  try{
+    res.setHeader('Cache-Control','no-store, max-age=0');
+    res.setHeader('X-Robots-Tag','noindex, nofollow');
+    const token=String(req.params.token||'').trim();
+    if(!token || token.length<20) return res.status(404).send('Booking details request not found.');
+
+    const b=(await pool.query(`
+      SELECT bi.*,t.trading_name,t.legal_name,t.email AS business_email,t.phone AS business_phone
+      FROM booking_intakes bi
+      JOIN invoice_tenants t ON t.id=bi.tenant_id
+      WHERE bi.public_token=$1
+      LIMIT 1
+    `,[token])).rows[0];
+    if(!b) return res.status(404).send('Booking details request not found.');
+
+    const ref=bookingReference(b);
+    const alreadyDone=['details_received','invoice_ready','invoiced'].includes(String(b.status||''));
+    const cancelled=String(b.status||'')==='cancelled';
+
+    const completion=cancelled
+      ? `<div class="notice warn"><strong>This booking request has been closed.</strong><br>Please contact Sotoboats if you need assistance.</div>`
+      : alreadyDone
+        ? `<div class="notice ok"><strong>Thank you — your details have been received.</strong><br>Sotoboats can now prepare the customer record and invoice for ${esc(ref)}.</div>`
+        : '';
+
+    const form=(!alreadyDone && !cancelled) ? `
+      <form method="post" action="/client-details/${encodeURIComponent(token)}" id="clientDetailsForm">
+        <div class="form-grid">
+          <label>Invoice type
+            <select name="customer_type" id="customerType">
+              <option value="individual">Individual / Personal</option>
+              <option value="business">Company / Business</option>
+            </select>
+          </label>
+          <label>Full name<input name="contact_name" value="${esc(b.contact_name||'')}" required></label>
+          <label id="companyWrap">Company / legal name<input name="company_name"></label>
+          <label>Email<input type="email" name="email" value="${esc(b.contact_email||'')}" required></label>
+          <label>Telephone<input name="phone" value="${esc(b.contact_phone||'')}" required></label>
+          <label>Tax / VAT / NIE / NIF number<input name="tax_number" placeholder="If applicable"></label>
+
+          <label class="full section-label">Billing address</label>
+          <label>Address<input name="billing_address_1" required></label>
+          <label>Address line 2<input name="billing_address_2"></label>
+          <label>Town / City<input name="billing_city" required></label>
+          <label>Province / Region<input name="billing_region"></label>
+          <label>Postcode<input name="billing_postcode" required></label>
+          <label>Country code<input name="billing_country_code" value="ES" maxlength="2" required></label>
+
+          <label class="full section-label">Identification for invoicing / Gestor records</label>
+          <label>ID type
+            <select name="identity_type">
+              <option value="">Choose if applicable</option>
+              <option>Passport</option>
+              <option>NIE</option>
+              <option>NIF</option>
+              <option>DNI</option>
+              <option>CIF</option>
+              <option>Other</option>
+            </select>
+          </label>
+          <label>ID / passport number<input name="identity_number"></label>
+          <label>ID issuing country<input name="identity_country_code" maxlength="2" placeholder="e.g. GB"></label>
+        </div>
+
+        <div class="privacy">
+          <strong>Why we ask for this</strong>
+          <span>Sotoboats / ${esc(b.legal_name||'Marbella Sailing School S.L.')} uses these details to manage your booking, prepare invoices and maintain accounting records for the Gestor. We do not ask you to upload a passport image.</span>
+        </div>
+
+        <label class="confirm"><input type="checkbox" name="confirmed" value="1" required> I confirm that the invoicing details above are correct.</label>
+        <button class="submit" type="submit">Send my details securely</button>
+      </form>
+      <script>
+        (function(){
+          const type=document.getElementById('customerType');
+          const company=document.getElementById('companyWrap');
+          function sync(){company.style.display=type.value==='business'?'grid':'none';}
+          type.addEventListener('change',sync); sync();
+        })();
+      </script>` : '';
+
+    res.send(`<!doctype html><html><head>
+      <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="robots" content="noindex,nofollow">
+      <meta name="theme-color" content="#0b1d2f">
+      <title>Sotoboats · Booking ${esc(ref)}</title>
+      <style>
+        *{box-sizing:border-box}body{margin:0;background:#f3f6f7;color:#0b1d2f;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .wrap{width:min(100%,720px);margin:auto;padding:28px 14px 50px}.brand{text-align:center;margin-bottom:18px}.brand img{width:225px;max-width:70%}
+        .card{background:#fff;border:1px solid #dce3e6;border-radius:20px;overflow:hidden;box-shadow:0 18px 50px rgba(11,29,47,.08)}
+        .head{padding:24px;background:#0b1d2f;color:#fff}.eyebrow{color:#caa86d;font-size:11px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
+        h1{font-family:Georgia,"Times New Roman",serif;margin:6px 0 0;font-size:28px}.body{padding:24px}
+        .summary{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#e2e8eb;border:1px solid #e2e8eb;border-radius:12px;overflow:hidden;margin-bottom:20px}
+        .summary div{background:#fff;padding:13px}.summary span{display:block;color:#71818a;font-size:10px;text-transform:uppercase}.summary strong{display:block;margin-top:4px;font-size:13px}
+        .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}.form-grid label{display:grid;gap:6px;font-size:11px;font-weight:700}.form-grid .full{grid-column:1/-1}
+        input,select{width:100%;border:1px solid #ccd7dc;border-radius:9px;padding:12px;background:#fff;color:#0b1d2f;font:inherit}
+        .section-label{margin-top:8px;padding-top:12px;border-top:1px solid #e6ebed;color:#796747;text-transform:uppercase;letter-spacing:.08em}
+        .privacy{margin:18px 0 12px;padding:14px;border-radius:11px;background:#eef5f8}.privacy strong,.privacy span{display:block}.privacy span{margin-top:5px;font-size:11px;line-height:1.55;color:#60747f}
+        .confirm{display:flex;gap:9px;align-items:flex-start;font-size:12px;line-height:1.45}.confirm input{width:auto;margin-top:2px}
+        .submit{width:100%;margin-top:16px;border:0;border-radius:11px;background:#caa86d;color:#0b1d2f;padding:15px;font-size:15px;font-weight:900;cursor:pointer}
+        .notice{padding:18px;border-radius:12px;line-height:1.6}.notice.ok{background:#edf8f1;color:#236642}.notice.warn{background:#fff6df;color:#7b5a11}
+        .footer{text-align:center;color:#7d8b92;font-size:10px;padding:16px}
+        @media(max-width:600px){.wrap{padding:12px 8px 30px}.body,.head{padding:19px}.form-grid,.summary{grid-template-columns:1fr}.form-grid .full{grid-column:auto}}
+      </style>
+    </head><body><main class="wrap">
+      <div class="brand"><img src="/sotoboats-logo.png" alt="Sotoboats"></div>
+      <section class="card">
+        <header class="head"><div class="eyebrow">Secure client details</div><h1>${esc(ref)}</h1></header>
+        <div class="body">
+          <div class="summary">
+            <div><span>Booking for</span><strong>${esc(b.contact_name||'')}</strong></div>
+            <div><span>Service</span><strong>${esc(b.service_title||'')}</strong></div>
+            ${b.service_start_date?`<div><span>Date</span><strong>${fmtDate(b.service_start_date)}</strong></div>`:''}
+            <div><span>Booking value</span><strong>${euro(b.agreed_price_minor)}</strong></div>
+          </div>
+          ${completion}
+          ${form}
+        </div>
+        <footer class="footer">${esc(b.trading_name||'Sotoboats')} · ${esc(b.business_email||'')}${b.business_phone?` · ${esc(b.business_phone)}`:''}</footer>
+      </section>
+    </main></body></html>`);
+  }catch(err){
+    console.error('Client details page failed:',err);
+    res.status(500).send('This form is temporarily unavailable. Please contact Sotoboats.');
+  }
+});
+
+app.post('/client-details/:token',async(req,res)=>{
+  try{
+    res.setHeader('Cache-Control','no-store, max-age=0');
+    res.setHeader('X-Robots-Tag','noindex, nofollow');
+    const token=String(req.params.token||'').trim();
+    const existing=(await pool.query(`SELECT * FROM booking_intakes WHERE public_token=$1 LIMIT 1`,[token])).rows[0];
+    if(!existing) return res.status(404).send('Booking details request not found.');
+    if(['details_received','invoice_ready','invoiced','cancelled'].includes(String(existing.status||''))) return res.redirect(`/client-details/${encodeURIComponent(token)}`);
+
+    const b=req.body;
+    const customerType=b.customer_type==='business'?'business':'individual';
+    const contactName=String(b.contact_name||'').trim();
+    const email=String(b.email||'').trim();
+    const phone=String(b.phone||'').trim();
+    const address=String(b.billing_address_1||'').trim();
+    const city=String(b.billing_city||'').trim();
+    const postcode=String(b.billing_postcode||'').trim();
+    const country=String(b.billing_country_code||'').trim().toUpperCase().slice(0,2);
+    const company=String(b.company_name||'').trim();
+    const tax=String(b.tax_number||'').trim();
+    const identityType=String(b.identity_type||'').trim();
+    const identityNumber=String(b.identity_number||'').trim();
+
+    if(!contactName || !email || !phone || !address || !city || !postcode || country.length!==2){
+      return res.status(400).send('Please complete all required contact and billing address fields.');
+    }
+    if(customerType==='business' && (!company || !tax)){
+      return res.status(400).send('For a business invoice, please enter the legal company name and Tax / VAT number.');
+    }
+    if(customerType==='individual' && !tax && !identityNumber){
+      return res.status(400).send('Please enter a tax / NIE / NIF number or an ID / passport number.');
+    }
+    if(identityNumber && !identityType){
+      return res.status(400).send('Please choose the ID type for the ID / passport number.');
+    }
+    if(b.confirmed!=='1') return res.status(400).send('Please confirm that the invoicing details are correct.');
+
+    await pool.query(`
+      UPDATE booking_intakes SET
+        submitted_customer_type=$1,
+        submitted_company_name=$2,
+        submitted_contact_name=$3,
+        submitted_email=$4,
+        submitted_phone=$5,
+        submitted_billing_address_1=$6,
+        submitted_billing_address_2=$7,
+        submitted_billing_city=$8,
+        submitted_billing_region=$9,
+        submitted_billing_postcode=$10,
+        submitted_billing_country_code=$11,
+        submitted_tax_number=$12,
+        submitted_identity_type=$13,
+        submitted_identity_number=$14,
+        submitted_identity_country_code=$15,
+        status='details_received',
+        details_submitted_at=now(),
+        updated_at=now()
+      WHERE id=$16
+    `,[
+      customerType,company||null,contactName,email,phone,address,String(b.billing_address_2||'').trim()||null,
+      city,String(b.billing_region||'').trim()||null,postcode,country,tax||null,
+      identityType||null,identityNumber||null,String(b.identity_country_code||'').trim().toUpperCase().slice(0,2)||null,
+      existing.id
+    ]);
+
+    res.redirect(`/client-details/${encodeURIComponent(token)}`);
+  }catch(err){
+    console.error('Client details submission failed:',err);
+    res.status(500).send('Your details could not be saved. Please contact Sotoboats.');
+  }
+});
+
 app.use(requireAuth);
+
+app.get('/bookings',async(req,res)=>{
+  const tenant=await getTenant();
+  const rows=(await pool.query(`
+    SELECT bi.*,i.invoice_number
+    FROM booking_intakes bi
+    LEFT JOIN customer_invoices i ON i.id=bi.invoice_id
+    WHERE bi.tenant_id=$1
+    ORDER BY bi.created_at DESC
+    LIMIT 400
+  `,[tenant.id])).rows;
+
+  const awaiting=rows.filter(r=>['agreed','details_requested'].includes(r.status)).length;
+  const ready=rows.filter(r=>r.status==='details_received').length;
+  const invoiceReady=rows.filter(r=>['invoice_ready','invoiced'].includes(r.status)).length;
+  const total=rows.filter(r=>r.status!=='cancelled').reduce((s,r)=>s+Number(r.agreed_price_minor||0),0);
+
+  const table=rows.length?`<div class="table-wrap"><table>
+    <thead><tr><th>Booking</th><th>Client</th><th>Service</th><th>Date</th><th>Value</th><th>Status</th><th></th></tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td><strong>${esc(bookingReference(r))}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td>
+      <td><strong>${esc(r.contact_name||'')}</strong><br><span class="muted">${esc(r.contact_phone||r.contact_email||'')}</span></td>
+      <td>${esc(r.service_title||'')}</td>
+      <td>${r.service_start_date?fmtDate(r.service_start_date):'—'}</td>
+      <td><strong>${euro(r.agreed_price_minor)}</strong></td>
+      <td>${bookingStatusBadge(r.status)}</td>
+      <td><a class="btn light" href="/bookings/${r.id}">${r.status==='details_received'?'Review':'Open'}</a></td>
+    </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No bookings have been added yet.</p>';
+
+  const content=`
+    <div class="metrics">
+      <div class="metric"><small>Waiting for details</small><strong>${awaiting}</strong></div>
+      <div class="metric"><small>Ready to review</small><strong>${ready}</strong></div>
+      <div class="metric"><small>Invoice ready / issued</small><strong>${invoiceReady}</strong></div>
+      <div class="metric"><small>Booking value</small><strong>${euro(total)}</strong></div>
+    </div>
+    <section class="card">
+      <div class="actions" style="justify-content:space-between;margin-bottom:14px">
+        <div><h2 style="margin:0">Bookings</h2><p class="sub" style="margin:4px 0 0">Dave enters the booking. The client supplies the invoicing details.</p></div>
+        <a class="btn gold" href="/bookings/new">+ New booking</a>
+      </div>
+      ${table}
+    </section>`;
+  res.send(shell('Bookings','bookings',content,'Booking agreed → client details requested → invoice ready.'));
+});
+
+app.get('/bookings/new',async(req,res)=>{
+  const tenant=await getTenant();
+  const content=`<section class="form-card">
+    <div class="actions" style="justify-content:space-between"><div><h2>New booking</h2><p class="sub">Only enter what Dave knows at the point of sale. The client completes the Gestor / invoice details.</p></div><a class="btn light" href="/bookings">Back</a></div>
+    <form method="post" action="/bookings" id="bookingForm">
+      <div class="form-grid three">
+        <label>Client name<input name="contact_name" required></label>
+        <label>Email<input type="email" name="contact_email"></label>
+        <label>Mobile<input name="contact_phone" placeholder="+34..."></label>
+        <label class="full">Service / booking<input name="service_title" placeholder="e.g. Catamaran charter" required></label>
+        <label>Start date<input type="date" name="service_start_date"></label>
+        <label>End date<input type="date" name="service_end_date"></label>
+        <label>Agreed price €<input type="number" min="0.01" step="0.01" name="agreed_price" required></label>
+        <label>Price basis<select name="price_includes_vat"><option value="1" selected>Price includes IVA</option><option value="0">Price before IVA</option></select></label>
+        <label>IVA rate<select name="tax_rate"><option value="21" selected>21%</option><option value="10">10%</option><option value="0">0%</option></select></label>
+        <label>Payment due now<select name="payment_mode" id="bookingPaymentMode"><option value="auto" selected>Auto from booking date</option><option value="deposit">${Number(tenant.deposit_percent||25)}% deposit</option><option value="full">Full balance</option><option value="custom">Custom amount</option></select></label>
+        <label id="bookingCustomWrap" style="display:none">Custom due €<input type="number" min="0" step="0.01" name="custom_amount_due"></label>
+        <label>Send details request by<select name="request_channel" id="requestChannel"><option value="email" selected>Email</option><option value="whatsapp">WhatsApp</option><option value="sms">SMS</option></select></label>
+        <label class="full">Internal notes<textarea name="internal_notes"></textarea></label>
+      </div>
+      <div class="notice" style="margin-top:12px"><strong>Dave's job ends here.</strong><br>The client completes their own address, tax / VAT / NIE / passport details. Sotoboats then prepares the customer record and draft invoice.</div>
+      <div class="actions" style="margin-top:14px"><button class="btn gold">Create & send request</button></div>
+    </form>
+  </section>
+  <script>
+    (function(){
+      const mode=document.getElementById('bookingPaymentMode'), wrap=document.getElementById('bookingCustomWrap');
+      function sync(){wrap.style.display=mode.value==='custom'?'grid':'none';}
+      mode.addEventListener('change',sync);sync();
+    })();
+  </script>`;
+  res.send(shell('New Booking','bookings',content,'Capture the sale, then let Sotoboats collect the admin.'));
+});
+
+app.post('/bookings',async(req,res)=>{
+  try{
+    const tenant=await getTenant();
+    const b=req.body;
+    const name=String(b.contact_name||'').trim();
+    const email=String(b.contact_email||'').trim();
+    const phone=String(b.contact_phone||'').trim();
+    const service=String(b.service_title||'').trim();
+    const agreed=minor(b.agreed_price);
+    const channel=['email','whatsapp','sms'].includes(String(b.request_channel||''))?String(b.request_channel):'email';
+    if(!name || !service || agreed<=0) throw new Error('Client name, service and agreed price are required.');
+    if(channel==='email' && !email) throw new Error('Add the client email address or choose WhatsApp / SMS.');
+    if(['whatsapp','sms'].includes(channel) && !phone) throw new Error('Add the client mobile number or choose Email.');
+
+    const token=crypto.randomBytes(24).toString('base64url');
+    const row=(await pool.query(`
+      INSERT INTO booking_intakes(
+        tenant_id,public_token,status,contact_name,contact_email,contact_phone,service_title,
+        service_start_date,service_end_date,agreed_price_minor,price_includes_vat,tax_rate,
+        payment_mode,custom_amount_due_minor,internal_notes,request_channel,created_by
+      ) VALUES($1,$2,'agreed',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'Sotoboats Admin')
+      RETURNING *
+    `,[
+      tenant.id,token,name,email||null,phone||null,service,b.service_start_date||null,b.service_end_date||null,
+      agreed,b.price_includes_vat!=='0',Number(b.tax_rate||21),b.payment_mode||'auto',
+      b.payment_mode==='custom'?minor(b.custom_amount_due):null,String(b.internal_notes||'').trim()||null,channel
+    ])).rows[0];
+
+    if(channel==='email'){
+      try{
+        await sendBookingDetailsEmail(tenant,row,req);
+        return res.redirect(`/bookings/${row.id}?sent=email`);
+      }catch(err){
+        console.error('Booking request email failed:',err);
+        return res.redirect(`/bookings/${row.id}?email_error=1`);
+      }
+    }
+    return res.redirect(`/bookings/${row.id}/send/${channel}`);
+  }catch(err){
+    res.status(400).send(shell('Booking error','bookings',`<section class="card"><h2>Could not create booking</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/bookings/new">Go back</a></section>`));
+  }
+});
+
+app.get('/bookings/:id',async(req,res)=>{
+  const tenant=await getTenant();
+  const b=(await pool.query(`
+    SELECT bi.*,i.invoice_number
+    FROM booking_intakes bi
+    LEFT JOIN customer_invoices i ON i.id=bi.invoice_id
+    WHERE bi.id=$1 AND bi.tenant_id=$2
+  `,[req.params.id,tenant.id])).rows[0];
+  if(!b) return res.status(404).send('Booking not found.');
+
+  const link=bookingDetailsUrl(b,req);
+  const wa=`/bookings/${b.id}/send/whatsapp`;
+  const sms=`/bookings/${b.id}/send/sms`;
+  const submitted=b.status==='details_received' || b.status==='invoice_ready' || b.status==='invoiced';
+
+  const submittedCard=submitted?`<section class="card">
+    <h2>Client invoicing details</h2>
+    <div class="table-wrap"><table><tbody>
+      <tr><th>Type</th><td>${esc(b.submitted_customer_type||'')}</td></tr>
+      <tr><th>Name</th><td>${esc(b.submitted_contact_name||'')}</td></tr>
+      <tr><th>Company</th><td>${esc(b.submitted_company_name||'—')}</td></tr>
+      <tr><th>Email</th><td>${esc(b.submitted_email||'')}</td></tr>
+      <tr><th>Phone</th><td>${esc(b.submitted_phone||'')}</td></tr>
+      <tr><th>Billing address</th><td>${esc([b.submitted_billing_address_1,b.submitted_billing_address_2,b.submitted_billing_city,b.submitted_billing_region,b.submitted_billing_postcode,b.submitted_billing_country_code].filter(Boolean).join(', '))}</td></tr>
+      <tr><th>Tax / VAT / NIE / NIF</th><td>${esc(b.submitted_tax_number||'—')}</td></tr>
+      <tr><th>ID</th><td>${esc([b.submitted_identity_type,b.submitted_identity_number,b.submitted_identity_country_code].filter(Boolean).join(' · ')||'—')}</td></tr>
+    </tbody></table></div>
+    ${b.status==='details_received'?`<form method="post" action="/bookings/${b.id}/approve" onsubmit="return confirm('Approve these details and create the customer and draft invoice?');"><button class="btn gold">Approve details & create draft invoice</button></form>`:''}
+  </section>`:'';
+
+  const requestActions=!submitted && b.status!=='cancelled'?`<section class="card">
+    <h2>Request client details</h2>
+    <p class="sub">Secure link: <span style="word-break:break-all">${esc(link)}</span></p>
+    ${req.query.email_error?'<div class="error">The booking was saved, but the email could not be sent. Check the email configuration or use WhatsApp / SMS.</div>':''}
+    <div class="actions">
+      ${b.contact_email?`<form method="post" action="/bookings/${b.id}/send/email"><button class="btn gold">Send email</button></form>`:''}
+      ${b.contact_phone?`<a class="btn light" href="${wa}" target="_blank">WhatsApp</a><a class="btn light" href="${sms}">SMS</a>`:''}
+      <button class="btn light" type="button" onclick="copyBookingLink(${JSON.stringify(link)},this)">Copy link</button>
+      <a class="btn light" href="${esc(link)}" target="_blank">Preview form</a>
+    </div>
+    <p class="sub" style="margin-top:10px">${b.request_sent_at?`Last requested ${fmtDate(b.request_sent_at)} · ${Number(b.request_sent_count||0)} send/share action(s)`:'Not sent yet.'}</p>
+  </section>`:'';
+
+  const invoiceBlock=b.invoice_id?`<section class="card"><h2>Invoice</h2><p class="sub">The customer record and draft invoice have been created from the approved client details.</p><a class="btn gold" href="/invoices/${b.invoice_id}">${b.invoice_number?`Open invoice ${esc(b.invoice_number)}`:'Open draft invoice'}</a></section>`:'';
+
+  const content=`<section class="card">
+    <div class="actions" style="justify-content:space-between">
+      <div><h2 style="margin:0">${esc(bookingReference(b))}</h2><p class="sub" style="margin:5px 0 0">${esc(b.service_title||'')}</p></div>
+      <div>${bookingStatusBadge(b.status)}</div>
+    </div>
+    <div class="table-wrap" style="margin-top:14px"><table><tbody>
+      <tr><th>Client</th><td>${esc(b.contact_name||'')}</td></tr>
+      <tr><th>Contact</th><td>${esc([b.contact_email,b.contact_phone].filter(Boolean).join(' · ')||'—')}</td></tr>
+      <tr><th>Service date</th><td>${b.service_start_date?fmtDate(b.service_start_date):'—'}</td></tr>
+      <tr><th>Agreed price</th><td><strong>${euro(b.agreed_price_minor)}</strong> · ${b.price_includes_vat?'IVA included':'plus IVA'} · ${Number(b.tax_rate||0)}%</td></tr>
+      <tr><th>Payment plan</th><td>${esc(String(b.payment_mode||'auto').replaceAll('_',' '))}</td></tr>
+    </tbody></table></div>
+  </section>
+  ${requestActions}
+  ${submittedCard}
+  ${invoiceBlock}
+  <script>
+    function copyBookingLink(url,button){
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(url).then(function(){const old=button.textContent;button.textContent='Copied';setTimeout(function(){button.textContent=old;},1200);});
+      }
+    }
+  </script>`;
+  res.send(shell(`Booking ${bookingReference(b)}`,'bookings',content,'One booking record from agreement through invoicing.'));
+});
+
+app.post('/bookings/:id/send/email',async(req,res)=>{
+  try{
+    const tenant=await getTenant();
+    const b=(await pool.query(`SELECT * FROM booking_intakes WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+    if(!b) throw new Error('Booking not found.');
+    await sendBookingDetailsEmail(tenant,b,req);
+    res.redirect(`/bookings/${b.id}?sent=email`);
+  }catch(err){
+    res.status(400).send(shell('Booking email','bookings',`<section class="card"><h2>Could not send the request</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/bookings/${req.params.id}">Back</a></section>`));
+  }
+});
+
+app.get('/bookings/:id/send/whatsapp',async(req,res)=>{
+  const tenant=await getTenant();
+  const b=(await pool.query(`SELECT * FROM booking_intakes WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!b) return res.status(404).send('Booking not found.');
+  const phone=cleanPhoneForWhatsApp(b.contact_phone);
+  if(!phone) return res.redirect(`/bookings/${b.id}`);
+  await pool.query(`UPDATE booking_intakes SET status=CASE WHEN status='agreed' THEN 'details_requested' ELSE status END,request_channel='whatsapp',request_sent_at=now(),request_sent_count=request_sent_count+1,updated_at=now() WHERE id=$1`,[b.id]);
+  const message=bookingRequestMessage(b,req);
+  res.redirect(`https://wa.me/${phone}?text=${encodeURIComponent(message)}`);
+});
+
+app.get('/bookings/:id/send/sms',async(req,res)=>{
+  const tenant=await getTenant();
+  const b=(await pool.query(`SELECT * FROM booking_intakes WHERE id=$1 AND tenant_id=$2`,[req.params.id,tenant.id])).rows[0];
+  if(!b) return res.status(404).send('Booking not found.');
+  const phone=String(b.contact_phone||'').trim();
+  if(!phone) return res.redirect(`/bookings/${b.id}`);
+  await pool.query(`UPDATE booking_intakes SET status=CASE WHEN status='agreed' THEN 'details_requested' ELSE status END,request_channel='sms',request_sent_at=now(),request_sent_count=request_sent_count+1,updated_at=now() WHERE id=$1`,[b.id]);
+  const message=bookingRequestMessage(b,req);
+  res.redirect(`sms:${encodeURIComponent(phone)}?body=${encodeURIComponent(message)}`);
+});
+
+app.post('/bookings/:id/approve',async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=await getTenant(client);
+    const b=(await client.query(`SELECT * FROM booking_intakes WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[req.params.id,tenant.id])).rows[0];
+    if(!b) throw new Error('Booking not found.');
+    if(b.status!=='details_received') throw new Error('Client details must be received before approval.');
+
+    const email=String(b.submitted_email||'').trim();
+    const phone=String(b.submitted_phone||'').trim();
+    let customer=(await client.query(`
+      SELECT * FROM invoice_customers
+      WHERE tenant_id=$1 AND is_active=true
+        AND (
+          ($2<>'' AND lower(COALESCE(email,''))=lower($2))
+          OR
+          ($3<>'' AND regexp_replace(COALESCE(phone,''),'[^0-9]','','g')=regexp_replace($3,'[^0-9]','','g'))
+        )
+      ORDER BY updated_at DESC
+      LIMIT 1
+      FOR UPDATE
+    `,[tenant.id,email,phone])).rows[0];
+
+    const customerValues=[
+      b.submitted_customer_type||'individual',
+      b.submitted_company_name||null,
+      b.submitted_contact_name,
+      email||null,
+      phone||null,
+      b.submitted_billing_address_1||null,
+      b.submitted_billing_address_2||null,
+      b.submitted_billing_city||null,
+      b.submitted_billing_region||null,
+      b.submitted_billing_postcode||null,
+      b.submitted_billing_country_code||'ES',
+      b.submitted_tax_number||null,
+      b.submitted_identity_type||null,
+      b.submitted_identity_number||null,
+      b.submitted_identity_country_code||null
+    ];
+
+    if(customer){
+      customer=(await client.query(`
+        UPDATE invoice_customers SET
+          customer_type=$1,company_name=$2,contact_name=$3,email=$4,phone=$5,
+          billing_address_1=$6,billing_address_2=$7,billing_city=$8,billing_region=$9,
+          billing_postcode=$10,billing_country_code=$11,tax_number=$12,identity_type=$13,
+          identity_number=$14,identity_country_code=$15,updated_at=now()
+        WHERE id=$16
+        RETURNING *
+      `,[...customerValues,customer.id])).rows[0];
+    }else{
+      customer=(await client.query(`
+        INSERT INTO invoice_customers(
+          tenant_id,customer_type,company_name,contact_name,email,phone,billing_address_1,billing_address_2,
+          billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,
+          identity_number,identity_country_code
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        RETURNING *
+      `,[tenant.id,...customerValues])).rows[0];
+    }
+
+    const rate=Number(b.tax_rate||0);
+    const agreed=Number(b.agreed_price_minor||0);
+    let net,vat,total;
+    if(b.price_includes_vat){
+      total=agreed;
+      net=rate>0?Math.round(total/(1+(rate/100))):total;
+      vat=total-net;
+    }else{
+      net=agreed;
+      vat=Math.round(net*(rate/100));
+      total=net+vat;
+    }
+
+    let dueNow=total;
+    const mode=String(b.payment_mode||'auto');
+    if(mode==='deposit') dueNow=Math.round(total*Number(tenant.deposit_percent||25)/100);
+    if(mode==='custom') dueNow=Math.min(total,Math.max(0,Number(b.custom_amount_due_minor||0)));
+    if(mode==='auto' && b.service_start_date){
+      const start=new Date(`${dateYmd(b.service_start_date)}T12:00:00`);
+      const days=(start-new Date())/86400000;
+      dueNow=days>Number(tenant.deposit_threshold_days||30)
+        ? Math.round(total*Number(tenant.deposit_percent||25)/100)
+        : total;
+    }
+
+    const today=new Date().toISOString().slice(0,10);
+    const dueDateObj=new Date(`${today}T12:00:00`);
+    dueDateObj.setDate(dueDateObj.getDate()+Number(tenant.payment_terms_days||5));
+    const dueDate=dueDateObj.toISOString().slice(0,10);
+
+    const invoice=(await client.query(`
+      INSERT INTO customer_invoices(
+        tenant_id,customer_id,booking_intake_id,invoice_language,issue_date,due_date,
+        service_title,service_start_date,service_end_date,booking_reference,
+        internal_notes,subtotal_minor,tax_minor,total_minor,outstanding_minor,
+        amount_due_now_minor,payment_mode,bank_transfer_enabled,online_payments_enabled
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16,true,true)
+      RETURNING *
+    `,[
+      tenant.id,customer.id,b.id,tenant.default_language||'bilingual',today,dueDate,
+      b.service_title,b.service_start_date||null,b.service_end_date||null,bookingReference(b),
+      b.internal_notes||null,net,vat,total,dueNow,mode
+    ])).rows[0];
+
+    await client.query(`
+      INSERT INTO customer_invoice_items(
+        invoice_id,sort_order,description_en,description_es,quantity,unit_price_minor,tax_rate,
+        line_net_minor,line_tax_minor,line_total_minor
+      ) VALUES($1,0,$2,$2,1,$3,$4,$3,$5,$6)
+    `,[invoice.id,b.service_title,net,rate,vat,total]);
+
+    await client.query(`
+      INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+      VALUES($1,$2,'draft_created','Sotoboats Booking Workflow',
+        jsonb_build_object('booking_intake_id',to_jsonb($3::text),'booking_reference',to_jsonb($4::text),'total_minor',to_jsonb($5::bigint)))
+    `,[tenant.id,invoice.id,String(b.id),bookingReference(b),total]);
+
+    await client.query(`
+      UPDATE booking_intakes
+      SET status='invoice_ready',customer_id=$1,invoice_id=$2,approved_at=now(),updated_at=now()
+      WHERE id=$3
+    `,[customer.id,invoice.id,b.id]);
+
+    await client.query('COMMIT');
+    res.redirect(`/invoices/${invoice.id}`);
+  }catch(err){
+    try{await client.query('ROLLBACK');}catch(_){}
+    res.status(400).send(shell('Booking approval','bookings',`<section class="card"><h2>Could not create the invoice</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/bookings/${req.params.id}">Back</a></section>`));
+  }finally{
+    client.release();
+  }
+});
 
 app.get('/payment-requests',async(req,res)=>{
   const tenant=await getTenant();
@@ -2219,8 +2872,9 @@ function customerForm(c={}, action='/customers', heading='New customer') {
     <label>Region<input name="billing_region" value="${esc(c.billing_region||'')}"></label>
     <label>Postcode<input name="billing_postcode" value="${esc(c.billing_postcode||'')}"></label>
     <label>Country code<input name="billing_country_code" value="${esc(c.billing_country_code||'ES')}" maxlength="2"></label>
-    <label>Passport / ID type<input name="identity_type" value="${esc(c.identity_type||'')}" placeholder="Optional"></label>
+    <label>Passport / ID type<input name="identity_type" value="${esc(c.identity_type||'')}" placeholder="Passport / NIE / NIF / DNI"></label>
     <label>Passport / ID number<input name="identity_number" value="${esc(c.identity_number||'')}" placeholder="Optional"></label>
+    <label>ID issuing country<input name="identity_country_code" value="${esc(c.identity_country_code||c.billing_country_code||'')}" maxlength="2" placeholder="e.g. GB"></label>
     <label class="full">Internal notes<textarea name="notes">${esc(c.notes||'')}</textarea></label>
   </div><div class="actions"><button class="btn gold">Save customer</button></div></form></section>`;
 }
@@ -2241,6 +2895,7 @@ function customerValues(b){
     b.tax_number||null,
     b.identity_type||null,
     b.identity_number||null,
+    (b.identity_country_code||'').toUpperCase().slice(0,2)||null,
     b.notes||null
   ];
 }
@@ -2264,8 +2919,8 @@ app.post('/customers',async(req,res)=>{
   await pool.query(`
     INSERT INTO invoice_customers(
       tenant_id,customer_type,company_name,contact_name,email,phone,billing_address_1,billing_address_2,
-      billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,identity_number,notes
-    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      billing_city,billing_region,billing_postcode,billing_country_code,tax_number,identity_type,identity_number,identity_country_code,notes
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
   `,[tenant.id,...v]);
   res.redirect('/customers');
 });
@@ -2287,8 +2942,8 @@ app.post('/customers/:id/edit',async(req,res)=>{
       customer_type=$1,company_name=$2,contact_name=$3,email=$4,phone=$5,
       billing_address_1=$6,billing_address_2=$7,billing_city=$8,billing_region=$9,
       billing_postcode=$10,billing_country_code=$11,tax_number=$12,identity_type=$13,
-      identity_number=$14,notes=$15,updated_at=now()
-    WHERE id=$16 AND tenant_id=$17
+      identity_number=$14,identity_country_code=$15,notes=$16,updated_at=now()
+    WHERE id=$17 AND tenant_id=$18
   `,[...v,req.params.id,tenant.id]);
   res.redirect('/customers');
 });
@@ -3310,6 +3965,9 @@ app.post('/invoices/:id/issue',async(req,res)=>{
        VALUES($1,$2,'invoice_issued','Sotoboats Admin',jsonb_build_object('invoice_number',to_jsonb($3::text)))`,
       [tenant.id,i.id,number]
     );
+    if(i.booking_intake_id){
+      await client.query(`UPDATE booking_intakes SET status='invoiced',updated_at=now() WHERE id=$1 AND tenant_id=$2`,[i.booking_intake_id,tenant.id]);
+    }
     await client.query('COMMIT');
     res.redirect(`/invoices/${i.id}`);
   }catch(err){
