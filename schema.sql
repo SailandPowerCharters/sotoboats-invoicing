@@ -224,6 +224,8 @@ CREATE TABLE IF NOT EXISTS payment_requests (
   tenant_id uuid NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
   request_number bigserial UNIQUE,
   invoice_id uuid REFERENCES customer_invoices(id) ON DELETE SET NULL,
+  booking_intake_id uuid REFERENCES booking_intakes(id) ON DELETE SET NULL,
+  payment_kind text NOT NULL DEFAULT 'other' CHECK (payment_kind IN ('deposit','balance','part','full','other')),
   customer_name text NOT NULL,
   customer_phone text,
   customer_email text,
@@ -252,6 +254,8 @@ CREATE TABLE IF NOT EXISTS payment_requests (
 -- Migration safety for an existing Payment Requests table created before Stripe support.
 -- The ALTER must happen before creating an index that references the new Stripe column.
 ALTER TABLE payment_requests
+  ADD COLUMN IF NOT EXISTS booking_intake_id uuid REFERENCES booking_intakes(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS payment_kind text NOT NULL DEFAULT 'other',
   ADD COLUMN IF NOT EXISTS stripe_payment_intent_id text,
   ADD COLUMN IF NOT EXISTS stripe_payment_status text,
   ADD COLUMN IF NOT EXISTS stripe_charge_id text,
@@ -260,6 +264,7 @@ ALTER TABLE payment_requests
 
 CREATE INDEX IF NOT EXISTS idx_payment_requests_tenant_status ON payment_requests(tenant_id,status,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice ON payment_requests(invoice_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_payment_requests_booking ON payment_requests(booking_intake_id,created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
   ON payment_requests(stripe_payment_intent_id)
   WHERE stripe_payment_intent_id IS NOT NULL;
