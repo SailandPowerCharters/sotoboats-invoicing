@@ -5276,8 +5276,6 @@ async function initialiseDatabase() {
       ON payment_requests(tenant_id,status,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice
       ON payment_requests(invoice_id,created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_payment_requests_booking
-      ON payment_requests(booking_intake_id,created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
       ON payment_requests(stripe_payment_intent_id)
       WHERE stripe_payment_intent_id IS NOT NULL;
@@ -5292,6 +5290,9 @@ async function initialiseDatabase() {
       ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT,
       ADD COLUMN IF NOT EXISTS stripe_payment_method TEXT,
       ADD COLUMN IF NOT EXISTS stripe_paid_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_payment_requests_booking
       ON payment_requests(booking_intake_id,created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
