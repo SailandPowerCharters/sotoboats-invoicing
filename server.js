@@ -485,6 +485,16 @@ function bookingReference(booking) {
   return n>0 ? `SBK-${String(n).padStart(6,'0')}` : 'Sotoboats booking';
 }
 
+function paymentKindLabel(kind) {
+  return ({
+    deposit:'Deposit',
+    balance:'Balance',
+    part:'Part payment',
+    full:'Full payment',
+    other:'Payment'
+  })[String(kind||'other')] || 'Payment';
+}
+
 function bookingDetailsUrl(booking, req=null) {
   const token=String(booking?.public_token||'').trim();
   if(!token) return '';
@@ -631,9 +641,19 @@ async function ensureStripePaymentIntentForRequest(paymentRequestId) {
   try{
     await client.query('BEGIN');
     const r=(await client.query(`
-      SELECT pr.*,i.outstanding_minor AS invoice_outstanding_minor
+      SELECT pr.*,
+             i.outstanding_minor AS invoice_outstanding_minor,
+             b.agreed_price_minor AS booking_total_minor,
+             COALESCE((
+               SELECT SUM(x.amount_minor)
+               FROM payment_requests x
+               WHERE x.booking_intake_id=pr.booking_intake_id
+                 AND x.status='paid'
+                 AND x.id<>pr.id
+             ),0)::bigint AS booking_paid_other_minor
       FROM payment_requests pr
       LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
+      LEFT JOIN booking_intakes b ON b.id=pr.booking_intake_id
       WHERE pr.id=$1
       FOR UPDATE OF pr
     `,[paymentRequestId])).rows[0];
@@ -649,13 +669,18 @@ async function ensureStripePaymentIntentForRequest(paymentRequestId) {
 
     const requested=Math.max(0,Number(r.amount_minor||0));
     const linkedOutstanding=r.invoice_id==null?null:Math.max(0,Number(r.invoice_outstanding_minor||0));
-    if(requested<=0 || (linkedOutstanding!==null && linkedOutstanding<=0)){
+    const bookingRemaining=r.booking_intake_id==null?null:Math.max(0,Number(r.booking_total_minor||0)-Number(r.booking_paid_other_minor||0));
+    if(requested<=0 || (linkedOutstanding!==null && linkedOutstanding<=0) || (bookingRemaining!==null && bookingRemaining<=0)){
       await client.query('COMMIT');
       return {configured:true,available:false,reason:'settled'};
     }
     if(linkedOutstanding!==null && requested>linkedOutstanding){
       await client.query('COMMIT');
       return {configured:true,available:false,reason:'invoice_changed'};
+    }
+    if(bookingRemaining!==null && requested>bookingRemaining){
+      await client.query('COMMIT');
+      return {configured:true,available:false,reason:'booking_changed'};
     }
 
     const stripe=stripeClient();
@@ -691,6 +716,8 @@ async function ensureStripePaymentIntentForRequest(paymentRequestId) {
           payment_request_id:String(r.id),
           payment_reference:ref,
           invoice_id:r.invoice_id?String(r.invoice_id):'',
+          booking_id:r.booking_intake_id?String(r.booking_intake_id):'',
+          payment_kind:String(r.payment_kind||'other'),
           customer_name:String(r.customer_name||'').slice(0,500)
         }
       },{
@@ -1595,10 +1622,20 @@ app.get('/payment/:token',async(req,res)=>{
       SELECT pr.*,
              t.trading_name,t.legal_name,t.email AS business_email,t.phone AS business_phone,
              t.bank_account_name,t.bank_name,t.bank_iban,t.bank_bic,t.bank_address,
-             i.invoice_number,i.outstanding_minor AS invoice_outstanding_minor
+             i.invoice_number,i.outstanding_minor AS invoice_outstanding_minor,
+             b.booking_number,b.agreed_price_minor AS booking_total_minor,
+             b.service_title AS booking_service_title,b.duration_text AS booking_duration_text,
+             COALESCE((
+               SELECT SUM(x.amount_minor)
+               FROM payment_requests x
+               WHERE x.booking_intake_id=pr.booking_intake_id
+                 AND x.status='paid'
+                 AND x.id<>pr.id
+             ),0)::bigint AS booking_paid_before_minor
       FROM payment_requests pr
       JOIN invoice_tenants t ON t.id=pr.tenant_id
       LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
+      LEFT JOIN booking_intakes b ON b.id=pr.booking_intake_id
       WHERE pr.public_token=$1
       LIMIT 1
     `,[token])).rows[0];
@@ -1609,7 +1646,13 @@ app.get('/payment/:token',async(req,res)=>{
     const requested=Math.max(0,Number(r.amount_minor||0));
     const linkedOutstanding=r.invoice_id==null?null:Math.max(0,Number(r.invoice_outstanding_minor||0));
     const invoiceSettled=linkedOutstanding!==null && linkedOutstanding<=0;
-    const requestTooHigh=linkedOutstanding!==null && linkedOutstanding>0 && requested>linkedOutstanding;
+    const bookingTotal=r.booking_intake_id==null?null:Math.max(0,Number(r.booking_total_minor||0));
+    const bookingPaidBefore=r.booking_intake_id==null?0:Math.max(0,Number(r.booking_paid_before_minor||0));
+    const bookingRemainingBefore=bookingTotal==null?null:Math.max(0,bookingTotal-bookingPaidBefore);
+    const bookingRemainingAfter=bookingRemainingBefore==null?null:Math.max(0,bookingRemainingBefore-requested);
+    const invoiceRequestTooHigh=linkedOutstanding!==null && linkedOutstanding>0 && requested>linkedOutstanding;
+    const bookingRequestTooHigh=bookingRemainingBefore!==null && requested>bookingRemainingBefore;
+    const requestTooHigh=invoiceRequestTooHigh || bookingRequestTooHigh;
     const active=String(r.status||'')==='awaiting' && !invoiceSettled && !requestTooHigh;
     const bankName=String(r.bank_name||'Wise').trim();
     const accountName=String(r.bank_account_name||'').trim();
@@ -1647,7 +1690,7 @@ app.get('/payment/:token',async(req,res)=>{
     }else if(String(r.status||'')==='cancelled'){
       statusContent=`<div class="status warn"><strong>Payment request cancelled</strong><span>Please contact Sotoboats if you still need to make a payment.</span></div>`;
     }else if(requestTooHigh){
-      statusContent=`<div class="status warn"><strong>Payment request needs updating</strong><span>The linked invoice balance has changed. Please contact Sotoboats before making payment.</span></div>`;
+      statusContent=`<div class="status warn"><strong>Payment request needs updating</strong><span>The linked booking or invoice balance has changed. Please contact Sotoboats before making payment.</span></div>`;
     }else{
       const testBanner=stripeState.configured && stripeState.mode==='test'
         ? `<div class="test-banner"><strong>TEST MODE</strong><span>No real card will be charged while Sotoboats finishes Stripe verification.</span></div>`
@@ -1805,10 +1848,13 @@ app.get('/payment/:token',async(req,res)=>{
             <div class="details">
               <div class="row"><span>Customer</span><strong>${esc(r.customer_name||'')}</strong></div>
               <div class="row"><span>For</span><strong>${esc(r.purpose||'')}</strong></div>
+              ${r.booking_intake_id?`<div class="row"><span>Booking</span><strong>${esc(bookingReference(r))}</strong></div>`:''}
+              ${r.booking_intake_id?`<div class="row"><span>Booking value</span><strong>${euro(bookingTotal)}</strong></div>`:''}
+              ${r.booking_intake_id?`<div class="row"><span>Previously received</span><strong>${euro(bookingPaidBefore)}</strong></div>`:''}
               ${r.invoice_number?`<div class="row"><span>Invoice</span><strong>${esc(r.invoice_number)}</strong></div>`:''}
               <div class="row"><span>Reference</span><strong>${esc(requestRef)}</strong></div>
             </div>
-            <div class="amount"><span>Amount requested</span><strong>${euro(requested)}</strong></div>
+            <div class="amount"><span>${esc(paymentKindLabel(r.payment_kind))} requested</span><strong>${euro(requested)}</strong>${bookingRemainingAfter!==null?`<small>Booking balance after this payment: ${euro(bookingRemainingAfter)}</small>`:''}</div>
             ${statusContent}
           </div>
           <footer class="footer">${esc(r.trading_name||'Sotoboats')} · ${esc(r.business_email||'')} ${r.business_phone?`· ${esc(r.business_phone)}`:''}</footer>
@@ -2308,13 +2354,30 @@ app.post('/bookings',async(req,res)=>{
 
 app.get('/bookings/:id',async(req,res)=>{
   const tenant=await getTenant();
-  const b=(await pool.query(`
-    SELECT bi.*,i.invoice_number
-    FROM booking_intakes bi
-    LEFT JOIN customer_invoices i ON i.id=bi.invoice_id
-    WHERE bi.id=$1 AND bi.tenant_id=$2
-  `,[req.params.id,tenant.id])).rows[0];
+  const [bookingResult,paymentResult]=await Promise.all([
+    pool.query(`
+      SELECT bi.*,i.invoice_number,i.paid_minor AS invoice_paid_minor,i.outstanding_minor AS invoice_outstanding_minor
+      FROM booking_intakes bi
+      LEFT JOIN customer_invoices i ON i.id=bi.invoice_id
+      WHERE bi.id=$1 AND bi.tenant_id=$2
+    `,[req.params.id,tenant.id]),
+    pool.query(`
+      SELECT * FROM payment_requests
+      WHERE booking_intake_id=$1 AND tenant_id=$2
+      ORDER BY created_at DESC
+    `,[req.params.id,tenant.id])
+  ]);
+  const b=bookingResult.rows[0];
   if(!b) return res.status(404).send('Booking not found.');
+
+  const paymentRequests=paymentResult.rows;
+  const requestPaid=paymentRequests.filter(r=>r.status==='paid').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+  const requestAwaiting=paymentRequests.filter(r=>r.status==='awaiting').reduce((s,r)=>s+Number(r.amount_minor||0),0);
+  const received=b.invoice_id?Number(b.invoice_paid_minor||0):requestPaid;
+  const remaining=b.invoice_id?Math.max(0,Number(b.invoice_outstanding_minor||0)):Math.max(0,Number(b.agreed_price_minor||0)-received);
+  const availableToRequest=Math.max(0,remaining-requestAwaiting);
+  const depositTarget=Math.round(Number(b.agreed_price_minor||0)*Number(tenant.deposit_percent||25)/100);
+  const depositNeeded=Math.max(0,Math.min(availableToRequest,depositTarget-received-requestAwaiting));
 
   const link=bookingDetailsUrl(b,req);
   const wa=`/bookings/${b.id}/send/whatsapp`;
@@ -2333,7 +2396,7 @@ app.get('/bookings/:id',async(req,res)=>{
       <tr><th>Tax / VAT / NIE / NIF</th><td>${esc(b.submitted_tax_number||'—')}</td></tr>
       <tr><th>ID</th><td>${esc([b.submitted_identity_type,b.submitted_identity_number,b.submitted_identity_country_code].filter(Boolean).join(' · ')||'—')}</td></tr>
     </tbody></table></div>
-    ${b.status==='details_received'?`<form method="post" action="/bookings/${b.id}/approve" onsubmit="return confirm('Approve these details and create the customer and draft invoice?');"><button class="btn gold">Approve details & create draft invoice</button></form>`:''}
+    ${b.status==='details_received'?`<form method="post" action="/bookings/${b.id}/approve" onsubmit="return confirm('Approve these details and create the customer and draft invoice? Existing booking payments will be carried onto the invoice.');"><button class="btn gold">Approve details & create draft invoice</button></form>`:''}
   </section>`:'';
 
   const requestActions=!submitted && b.status!=='cancelled'?`<section class="card">
@@ -2349,7 +2412,32 @@ app.get('/bookings/:id',async(req,res)=>{
     <p class="sub" style="margin-top:10px">${b.request_sent_at?`Last requested ${fmtDate(b.request_sent_at)} · ${Number(b.request_sent_count||0)} send/share action(s)`:'Not sent yet.'}</p>
   </section>`:'';
 
-  const invoiceBlock=b.invoice_id?`<section class="card"><h2>Invoice</h2><p class="sub">The customer record and draft invoice have been created from the approved client details.</p><a class="btn gold" href="/invoices/${b.invoice_id}">${b.invoice_number?`Open invoice ${esc(b.invoice_number)}`:'Open draft invoice'}</a></section>`:'';
+  const paymentRows=paymentRequests.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Type</th><th>Amount</th><th>Status</th><th></th></tr></thead><tbody>${paymentRequests.map(r=>`<tr>
+    <td><strong>${esc(paymentRequestReference(r))}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td>
+    <td>${esc(paymentKindLabel(r.payment_kind))}</td>
+    <td><strong>${euro(r.amount_minor)}</strong></td>
+    <td>${r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>'}</td>
+    <td><a class="btn light" target="_blank" href="${esc(paymentRequestPageUrl(r,req))}">Open</a></td>
+  </tr>`).join('')}</tbody></table></div>`:'<p class="sub">No payment requests have been created for this booking yet.</p>';
+
+  const paymentsCard=`<section class="card">
+    <div class="actions" style="justify-content:space-between;margin-bottom:12px">
+      <div><h2 style="margin:0">Booking payments</h2><p class="sub" style="margin:4px 0 0">Payments stay attached to ${esc(bookingReference(b))}, whether or not an invoice exists yet.</p></div>
+    </div>
+    <div class="metrics" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <div class="metric"><small>Booking value</small><strong>${euro(b.agreed_price_minor)}</strong></div>
+      <div class="metric"><small>Received</small><strong>${euro(received)}</strong></div>
+      <div class="metric"><small>Awaiting</small><strong>${euro(requestAwaiting)}</strong></div>
+      <div class="metric"><small>Balance remaining</small><strong>${euro(remaining)}</strong></div>
+    </div>
+    ${availableToRequest>0?`<div class="actions" style="margin-bottom:12px">
+      ${depositNeeded>0?`<a class="btn light" href="/payment-requests/new?booking_id=${encodeURIComponent(b.id)}&kind=deposit">Request deposit · ${euro(depositNeeded)}</a>`:''}
+      <a class="btn gold" href="/payment-requests/new?booking_id=${encodeURIComponent(b.id)}&kind=balance">Request balance · ${euro(availableToRequest)}</a>
+    </div>`:''}
+    ${paymentRows}
+  </section>`;
+
+  const invoiceBlock=b.invoice_id?`<section class="card"><h2>Invoice</h2><p class="sub">The invoice is linked to this booking and inherits its recorded payments.</p><a class="btn gold" href="/invoices/${b.invoice_id}">${b.invoice_number?`Open invoice ${esc(b.invoice_number)}`:'Open draft invoice'}</a></section>`:'';
 
   const content=`<section class="card">
     <div class="actions" style="justify-content:space-between">
@@ -2366,6 +2454,7 @@ app.get('/bookings/:id',async(req,res)=>{
       <tr><th>Payment plan</th><td>${esc(String(b.payment_mode||'auto').replaceAll('_',' '))}</td></tr>
     </tbody></table></div>
   </section>
+  ${paymentsCard}
   ${requestActions}
   ${submittedCard}
   ${invoiceBlock}
@@ -2376,7 +2465,7 @@ app.get('/bookings/:id',async(req,res)=>{
       }
     }
   </script>`;
-  res.send(shell(`Booking ${bookingReference(b)}`,'bookings',content,'One booking record from agreement through invoicing.'));
+  res.send(shell(`Booking ${bookingReference(b)}`,'bookings',content,'One booking record from agreement through payments and invoicing.'));
 });
 
 app.post('/bookings/:id/send/email',async(req,res)=>{
@@ -2527,6 +2616,54 @@ app.post('/bookings/:id/approve',async(req,res)=>{
       ) VALUES($1,0,$2,$2,$3,$3,1,$4,$5,$4,$6,$7)
     `,[invoice.id,b.service_title,b.duration_text?`Duration: ${b.duration_text}`:null,net,rate,vat,total]);
 
+    const bookingPaymentRequests=(await client.query(`
+      SELECT * FROM payment_requests
+      WHERE booking_intake_id=$1 AND tenant_id=$2
+      ORDER BY paid_at,created_at
+      FOR UPDATE
+    `,[b.id,tenant.id])).rows;
+
+    let inheritedPaid=0;
+    for(const r of bookingPaymentRequests){
+      if(r.status!=='paid') continue;
+      inheritedPaid+=Number(r.amount_minor||0);
+      if(r.invoice_payment_id) continue;
+      const method=(r.stripe_payment_intent_id||r.stripe_paid_at)?'stripe':'wise';
+      const payment=(await client.query(`
+        INSERT INTO customer_invoice_payments(
+          tenant_id,invoice_id,amount_minor,currency_code,method,reference,paid_at
+        ) VALUES($1,$2,$3,'EUR',$4,$5,COALESCE($6,now()))
+        RETURNING id
+      `,[tenant.id,invoice.id,Number(r.amount_minor||0),method,r.paid_reference||paymentRequestReference(r),r.paid_at])).rows[0];
+      await client.query(`
+        UPDATE payment_requests SET invoice_id=$1,invoice_payment_id=$2,updated_at=now()
+        WHERE id=$3
+      `,[invoice.id,payment.id,r.id]);
+    }
+
+    await client.query(`
+      UPDATE payment_requests
+      SET invoice_id=$1,updated_at=now()
+      WHERE booking_intake_id=$2 AND tenant_id=$3 AND invoice_id IS NULL
+    `,[invoice.id,b.id,tenant.id]);
+
+    inheritedPaid=Math.min(total,inheritedPaid);
+    const inheritedOutstanding=Math.max(0,total-inheritedPaid);
+    const inheritedDueNow=Math.max(0,Math.min(inheritedOutstanding,dueNow-inheritedPaid));
+    await client.query(`
+      UPDATE customer_invoices
+      SET paid_minor=$1,outstanding_minor=$2,amount_due_now_minor=$3,updated_at=now()
+      WHERE id=$4
+    `,[inheritedPaid,inheritedOutstanding,inheritedDueNow,invoice.id]);
+
+    if(inheritedPaid>0){
+      await client.query(`
+        INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
+        VALUES($1,$2,'booking_payments_attached','Sotoboats Booking Workflow',
+          jsonb_build_object('amount_minor',to_jsonb($3::bigint),'booking_intake_id',to_jsonb($4::text)))
+      `,[tenant.id,invoice.id,inheritedPaid,String(b.id)]);
+    }
+
     await client.query(`
       INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
       VALUES($1,$2,'draft_created','Sotoboats Booking Workflow',
@@ -2553,10 +2690,12 @@ app.get('/payment-requests',async(req,res)=>{
   const tenant=await getTenant();
   const allRows=(await pool.query(`
     SELECT pr.*,i.invoice_number,i.outstanding_minor,
-           COALESCE(i.snapshot_contact_name,c.contact_name) AS invoice_contact_name
+           COALESCE(i.snapshot_contact_name,c.contact_name) AS invoice_contact_name,
+           b.booking_number,b.service_title AS booking_service_title
     FROM payment_requests pr
     LEFT JOIN customer_invoices i ON i.id=pr.invoice_id
     LEFT JOIN invoice_customers c ON c.id=i.customer_id
+    LEFT JOIN booking_intakes b ON b.id=pr.booking_intake_id
     WHERE pr.tenant_id=$1
     ORDER BY pr.created_at DESC
     LIMIT 300
@@ -2579,23 +2718,24 @@ app.get('/payment-requests',async(req,res)=>{
     ['cancelled','Cancelled',cancelled]
   ].map(([key,label,count])=>`<a class="btn ${filter===key?'gold':'light'}" href="/payment-requests?filter=${key}">${label} (${count})</a>`).join('');
 
-  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Customer</th><th>For</th><th>Amount</th><th>Status</th><th>Shared</th><th>Linked invoice</th><th></th></tr></thead><tbody>${rows.map(r=>{
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>Request</th><th>Customer</th><th>For</th><th>Amount</th><th>Status</th><th>Linked to</th><th></th></tr></thead><tbody>${rows.map(r=>{
     const url=paymentRequestPageUrl(r);
     const ref=paymentRequestReference(r);
     const phone=cleanPhoneForWhatsApp(r.customer_phone);
-    const message=`Hi ${r.customer_name||''}, here is your Sotoboats payment request for ${euro(r.amount_minor)} (${ref}): ${url}`;
+    const message=`Hi ${r.customer_name||''}, here is your Sotoboats ${paymentKindLabel(r.payment_kind).toLowerCase()} request for ${euro(r.amount_minor)} (${ref}): ${url}`;
     const wa=phone?`https://wa.me/${phone}?text=${encodeURIComponent(message)}`:`https://wa.me/?text=${encodeURIComponent(message)}`;
     const stripeInfo=r.stripe_payment_intent_id?`<br><span class="muted">Card: ${esc(r.stripe_payment_status||'ready')}</span>`:'';
     const status=(r.status==='paid'?'<span class="pill green">Paid</span>':r.status==='cancelled'?'<span class="pill red">Cancelled</span>':'<span class="pill amber">Awaiting</span>')+stripeInfo;
-    const share=r.share_count>0?`${Number(r.share_count)} · ${fmtDate(r.shared_at)}${r.last_shared_channel?` · ${esc(r.last_shared_channel)}`:''}`:'Not shared';
+    const links=[];
+    if(r.booking_intake_id) links.push(`<a href="/bookings/${r.booking_intake_id}">${esc(bookingReference(r))}</a>`);
+    if(r.invoice_number) links.push(`<a href="/invoices/${r.invoice_id}">${esc(r.invoice_number)}</a>`);
     return `<tr>
-      <td><strong>${esc(ref)}</strong><br><span class="muted">${fmtDate(r.created_at)}</span></td>
+      <td><strong>${esc(ref)}</strong><br><span class="muted">${fmtDate(r.created_at)} · ${esc(paymentKindLabel(r.payment_kind))}</span></td>
       <td><strong>${esc(r.customer_name||'')}</strong>${r.customer_phone?`<br><span class="muted">${esc(r.customer_phone)}</span>`:''}</td>
       <td>${esc(r.purpose||'')}</td>
       <td><strong>${euro(r.amount_minor)}</strong></td>
       <td>${status}</td>
-      <td><span class="muted">${share}</span></td>
-      <td>${r.invoice_number?`<a href="/invoices/${r.invoice_id}">${esc(r.invoice_number)}</a>`:'—'}</td>
+      <td>${links.length?links.join('<br>'):'Standalone'}</td>
       <td><div class="actions">
         <button class="btn light" type="button" onclick="copyPaymentRequest('${r.id}','${esc(url)}',this)">Copy link</button>
         <a class="btn light" target="_blank" href="${esc(wa)}" onclick="recordPaymentShare('${r.id}','whatsapp')">WhatsApp</a>
@@ -2603,7 +2743,7 @@ app.get('/payment-requests',async(req,res)=>{
         ${r.status==='awaiting'?`<form method="post" action="/payment-requests/${r.id}/paid" onsubmit="return confirm('Mark ${esc(ref)} as paid by bank transfer?');"><input name="reference" placeholder="Wise reference (optional)"><button class="btn gold">Mark bank transfer paid</button></form><form method="post" action="/payment-requests/${r.id}/cancel" onsubmit="return confirm('Cancel this payment request?');"><button class="btn light">Cancel</button></form>`:''}
       </div></td>
     </tr>`;
-  }).join('')}</tbody></table></div>`:'<p class="sub">No payment requests yet.</p>';
+  }).join('')}</tbody></table></div>`:'<p class="sub">No payment requests match this filter.</p>';
 
   const content=`<div class="metrics">
     <div class="metric"><small>Awaiting</small><strong>${awaiting}</strong></div>
@@ -2613,7 +2753,7 @@ app.get('/payment-requests',async(req,res)=>{
   </div>
   <section class="card">
     <div class="actions" style="justify-content:space-between;margin-bottom:14px">
-      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Create a Sotoboats-branded payment link, take card payments through Stripe, send it on the spot and keep a record of what was shared.</p></div>
+      <div><h2 style="margin:0">Payment requests</h2><p class="sub" style="margin:4px 0 0">Link deposits and balances to a booking even before an invoice exists.</p></div>
       <a class="btn gold" href="/payment-requests/new">+ New payment request</a>
     </div>
     <div class="actions" style="margin-bottom:14px">${paymentFilters}</div>
@@ -2621,60 +2761,133 @@ app.get('/payment-requests',async(req,res)=>{
   </section>
   <script>
   function recordPaymentShare(id,channel){
-    try{
-      fetch('/payment-requests/'+id+'/shared',{
-        method:'POST',
-        headers:{'Content-Type':'application/x-www-form-urlencoded'},
-        body:'channel='+encodeURIComponent(channel),
-        keepalive:true
-      });
-    }catch(_){}
+    try{fetch('/payment-requests/'+id+'/shared',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'channel='+encodeURIComponent(channel),keepalive:true});}catch(_){}
   }
   function copyPaymentRequest(id,url,button){
     recordPaymentShare(id,'copy');
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(url).then(function(){
-        const old=button.textContent;button.textContent='Copied';setTimeout(function(){button.textContent=old;},1200);
-      });
-    }
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(url).then(function(){const old=button.textContent;button.textContent='Copied';setTimeout(function(){button.textContent=old;},1200);});}
   }
   </script>`;
-  res.send(shell('Payment Requests','payment-requests',content,'Tracked Sotoboats payment links with Stripe card checkout and Wise bank transfer fallback.'));
+  res.send(shell('Payment Requests','payment-requests',content,'Booking-linked deposits, balances and standalone requests.'));
 });
 
 app.get('/payment-requests/new',async(req,res)=>{
   const tenant=await getTenant();
   const invoiceId=String(req.query.invoice_id||'').trim();
-  const invoices=(await pool.query(`
-    SELECT i.id,i.invoice_number,i.outstanding_minor,i.amount_due_now_minor,i.service_title,
-           COALESCE(i.snapshot_contact_name,c.contact_name) AS contact_name,
-           COALESCE(i.snapshot_phone,c.phone) AS phone,
-           COALESCE(i.snapshot_email,c.email) AS email
-    FROM customer_invoices i
-    JOIN invoice_customers c ON c.id=i.customer_id
-    WHERE i.tenant_id=$1 AND i.locked_at IS NOT NULL AND i.outstanding_minor>0
-    ORDER BY COALESCE(i.due_date,i.issue_date) ASC,i.created_at DESC
-  `,[tenant.id])).rows;
-  const selected=invoices.find(i=>String(i.id)===invoiceId)||null;
-  const defaultAmount=selected?Math.min(Number(selected.outstanding_minor||0),Math.max(0,Number(selected.amount_due_now_minor||selected.outstanding_minor||0))):0;
-  const options=['<option value="">No invoice — standalone payment request</option>'].concat(invoices.map(i=>`<option value="${i.id}" ${selected&&selected.id===i.id?'selected':''}>${esc(i.invoice_number||'Invoice')} · ${esc(i.contact_name||'')} · ${euro(i.outstanding_minor)} outstanding</option>`)).join('');
+  const bookingId=String(req.query.booking_id||'').trim();
+  const requestedKind=['deposit','balance','part','full','other'].includes(String(req.query.kind||''))?String(req.query.kind):'other';
+
+  const [invoiceRows,bookingRows]=await Promise.all([
+    pool.query(`
+      SELECT i.id,i.invoice_number,i.outstanding_minor,i.amount_due_now_minor,i.service_title,
+             COALESCE(i.snapshot_contact_name,c.contact_name) AS contact_name,
+             COALESCE(i.snapshot_phone,c.phone) AS phone,
+             COALESCE(i.snapshot_email,c.email) AS email
+      FROM customer_invoices i
+      JOIN invoice_customers c ON c.id=i.customer_id
+      WHERE i.tenant_id=$1 AND i.locked_at IS NOT NULL AND i.outstanding_minor>0
+      ORDER BY COALESCE(i.due_date,i.issue_date) ASC,i.created_at DESC
+    `,[tenant.id]),
+    pool.query(`
+      SELECT b.*,i.outstanding_minor AS invoice_outstanding_minor,i.paid_minor AS invoice_paid_minor,
+             COALESCE(SUM(pr.amount_minor) FILTER (WHERE pr.status='paid'),0)::bigint AS paid_request_minor,
+             COALESCE(SUM(pr.amount_minor) FILTER (WHERE pr.status='awaiting'),0)::bigint AS awaiting_request_minor
+      FROM booking_intakes b
+      LEFT JOIN customer_invoices i ON i.id=b.invoice_id
+      LEFT JOIN payment_requests pr ON pr.booking_intake_id=b.id
+      WHERE b.tenant_id=$1 AND b.status<>'cancelled'
+      GROUP BY b.id,i.outstanding_minor,i.paid_minor
+      ORDER BY b.service_start_date NULLS LAST,b.created_at DESC
+    `,[tenant.id])
+  ]);
+
+  const invoices=invoiceRows.rows;
+  const bookings=bookingRows.rows.map(b=>{
+    const paid=b.invoice_id?Number(b.invoice_paid_minor||0):Number(b.paid_request_minor||0);
+    const remaining=b.invoice_id?Math.max(0,Number(b.invoice_outstanding_minor||0)):Math.max(0,Number(b.agreed_price_minor||0)-paid);
+    const awaiting=Number(b.awaiting_request_minor||0);
+    const available=Math.max(0,remaining-awaiting);
+    const depositTarget=Math.round(Number(b.agreed_price_minor||0)*Number(tenant.deposit_percent||25)/100);
+    const depositAvailable=Math.max(0,Math.min(available,depositTarget-paid-awaiting));
+    return {...b,paid_calc:paid,remaining_calc:remaining,awaiting_calc:awaiting,available_calc:available,deposit_available_calc:depositAvailable};
+  });
+
+  const selectedBooking=bookings.find(b=>String(b.id)===bookingId)||null;
+  let selectedInvoice=invoices.find(i=>String(i.id)===invoiceId)||null;
+  if(selectedBooking?.invoice_id){selectedInvoice=invoices.find(i=>String(i.id)===String(selectedBooking.invoice_id))||selectedInvoice;}
+
+  const selectedKind=selectedBooking?requestedKind:'other';
+  const defaultCustomer=selectedBooking?.submitted_contact_name||selectedBooking?.contact_name||selectedInvoice?.contact_name||'';
+  const defaultPhone=selectedBooking?.submitted_phone||selectedBooking?.contact_phone||selectedInvoice?.phone||'';
+  const defaultEmail=selectedBooking?.submitted_email||selectedBooking?.contact_email||selectedInvoice?.email||'';
+  let defaultAmount=selectedInvoice?Math.min(Number(selectedInvoice.outstanding_minor||0),Math.max(0,Number(selectedInvoice.amount_due_now_minor||selectedInvoice.outstanding_minor||0))):0;
+  if(selectedBooking){
+    if(selectedKind==='deposit') defaultAmount=Number(selectedBooking.deposit_available_calc||0);
+    else if(['balance','full'].includes(selectedKind)) defaultAmount=Number(selectedBooking.available_calc||0);
+    else defaultAmount=0;
+  }
+  const defaultPurpose=selectedBooking
+    ? `${selectedBooking.service_title} – ${selectedKind==='deposit'?'Deposit':selectedKind==='balance'?'Balance':paymentKindLabel(selectedKind)}`
+    : (selectedInvoice?.service_title||'');
+
+  const invoiceOptions=['<option value="">No invoice</option>'].concat(invoices.map(i=>`<option value="${i.id}" ${selectedInvoice&&selectedInvoice.id===i.id?'selected':''}>${esc(i.invoice_number||'Invoice')} · ${esc(i.contact_name||'')} · ${euro(i.outstanding_minor)} outstanding</option>`)).join('');
+  const bookingOptions=['<option value="">Standalone / no booking</option>'].concat(bookings.filter(b=>b.available_calc>0 || String(b.id)===bookingId).map(b=>`<option value="${b.id}" ${selectedBooking&&selectedBooking.id===b.id?'selected':''}>${esc(bookingReference(b))} · ${esc(b.contact_name||'')} · ${esc(b.service_title||'')} · ${euro(b.available_calc)} available</option>`)).join('');
+
+  const bookingData=JSON.stringify(Object.fromEntries(bookings.map(b=>[String(b.id),{
+    id:String(b.id),name:b.submitted_contact_name||b.contact_name||'',phone:b.submitted_phone||b.contact_phone||'',email:b.submitted_email||b.contact_email||'',service:b.service_title||'',invoice_id:b.invoice_id?String(b.invoice_id):'',available:Number(b.available_calc||0),deposit:Number(b.deposit_available_calc||0),paid:Number(b.paid_calc||0),awaiting:Number(b.awaiting_calc||0),total:Number(b.agreed_price_minor||0),ref:bookingReference(b)
+  }]))).replace(/</g,'\\u003c');
 
   const content=`<section class="form-card">
-    <div class="actions" style="justify-content:space-between"><div><h2>New payment request</h2><p class="sub">Create the link while you are with the customer, then copy it or send it by WhatsApp. Card payments can be confirmed automatically by Stripe.</p></div><a class="btn light" href="/payment-requests">Back</a></div>
-    <form method="post" action="/payment-requests">
+    <div class="actions" style="justify-content:space-between"><div><h2>New payment request</h2><p class="sub">Link the request to a booking so deposits and later balance payments stay together even before an invoice exists.</p></div><a class="btn light" href="/payment-requests">Back</a></div>
+    <form method="post" action="/payment-requests" id="paymentRequestForm">
       <div class="form-grid">
-        <label>Customer name<input name="customer_name" value="${esc(selected?.contact_name||'')}" required></label>
-        <label>Customer phone<input name="customer_phone" value="${esc(selected?.phone||'')}" placeholder="+34..."></label>
-        <label>Customer email<input type="email" name="customer_email" value="${esc(selected?.email||'')}"></label>
-        <label>Amount €<input type="number" min="0.01" step="0.01" name="amount" value="${defaultAmount?major(defaultAmount).toFixed(2):''}" required></label>
-        <label class="full">What is this payment for?<input name="purpose" value="${esc(selected?.service_title||'')}" placeholder="e.g. Catamaran deposit, charter balance, boat delivery" required></label>
-        <label class="full">Link to invoice (optional)<select name="invoice_id">${options}</select></label>
+        <label class="full">Link to booking<select name="booking_intake_id" id="paymentBooking">${bookingOptions}</select></label>
+        <label>Payment type<select name="payment_kind" id="paymentKind"><option value="deposit" ${selectedKind==='deposit'?'selected':''}>Deposit</option><option value="balance" ${selectedKind==='balance'?'selected':''}>Balance</option><option value="part" ${selectedKind==='part'?'selected':''}>Part payment</option><option value="full" ${selectedKind==='full'?'selected':''}>Full payment</option><option value="other" ${selectedKind==='other'?'selected':''}>Other / standalone</option></select></label>
+        <label>Amount €<input id="paymentAmount" type="number" min="0.01" step="0.01" name="amount" value="${defaultAmount?major(defaultAmount).toFixed(2):''}" required></label>
+        <label>Customer name<input id="paymentCustomer" name="customer_name" value="${esc(defaultCustomer)}" required></label>
+        <label>Customer phone<input id="paymentPhone" name="customer_phone" value="${esc(defaultPhone)}" placeholder="+34..."></label>
+        <label>Customer email<input id="paymentEmail" type="email" name="customer_email" value="${esc(defaultEmail)}"></label>
+        <label class="full">What is this payment for?<input id="paymentPurpose" name="purpose" value="${esc(defaultPurpose)}" placeholder="e.g. Catamaran Charter – Deposit" required></label>
+        <label class="full">Link to issued invoice (optional)<select name="invoice_id" id="paymentInvoice">${invoiceOptions}</select></label>
       </div>
+      <div id="bookingPaymentSummary" class="notice" style="margin-top:12px;${selectedBooking?'':'display:none'}">${selectedBooking?`<strong>${esc(bookingReference(selectedBooking))}</strong><br>Booking value ${euro(selectedBooking.agreed_price_minor)} · received ${euro(selectedBooking.paid_calc)} · awaiting ${euro(selectedBooking.awaiting_calc)} · available to request ${euro(selectedBooking.available_calc)}`:''}</div>
       <div class="notice" style="margin-top:12px"><strong>Payment options</strong><br>Card: ${stripeConfigured()?`${esc(stripeCheckoutLabel())} checkout ready`:`Stripe keys not added yet`}<br>Bank transfer fallback: ${esc(tenant.bank_account_name||'')} · ${esc(tenant.bank_name||'Wise')} · IBAN ${esc(tenant.bank_iban||'')} · BIC ${esc(tenant.bank_bic||'')}</div>
       <div class="actions" style="margin-top:14px"><button class="btn gold">Create payment request</button></div>
     </form>
-  </section>`;
-  res.send(shell('New Payment Request','payment-requests',content,'A tracked Sotoboats link with card checkout plus Wise bank transfer fallback.'));
+  </section>
+  <script>
+  (function(){
+    const bookingData=${bookingData};
+    const booking=document.getElementById('paymentBooking');
+    const kind=document.getElementById('paymentKind');
+    const amount=document.getElementById('paymentAmount');
+    const customer=document.getElementById('paymentCustomer');
+    const phone=document.getElementById('paymentPhone');
+    const email=document.getElementById('paymentEmail');
+    const purpose=document.getElementById('paymentPurpose');
+    const invoice=document.getElementById('paymentInvoice');
+    const summary=document.getElementById('bookingPaymentSummary');
+    function money(minor){return '€'+(Number(minor||0)/100).toFixed(2);}
+    function syncBooking(forceAmount){
+      const b=bookingData[booking.value];
+      if(!b){summary.style.display='none';return;}
+      customer.value=b.name||customer.value; phone.value=b.phone||phone.value; email.value=b.email||email.value;
+      if(b.invoice_id) invoice.value=b.invoice_id;
+      const label=kind.value==='deposit'?'Deposit':kind.value==='balance'?'Balance':kind.value==='full'?'Full payment':kind.value==='part'?'Part payment':'Payment';
+      purpose.value=(b.service||'Booking')+' – '+label;
+      if(forceAmount){
+        if(kind.value==='deposit') amount.value=(Number(b.deposit||0)/100).toFixed(2);
+        else if(kind.value==='balance'||kind.value==='full') amount.value=(Number(b.available||0)/100).toFixed(2);
+      }
+      summary.style.display='block';
+      summary.innerHTML='<strong>'+b.ref+'</strong><br>Booking value '+money(b.total)+' · received '+money(b.paid)+' · awaiting '+money(b.awaiting)+' · available to request '+money(b.available);
+    }
+    booking.addEventListener('change',function(){syncBooking(true);});
+    kind.addEventListener('change',function(){syncBooking(true);});
+    syncBooking(false);
+  })();
+  </script>`;
+  res.send(shell('New Payment Request','payment-requests',content,'Create a deposit, balance or standalone payment request.'));
 });
 
 app.post('/payment-requests',async(req,res)=>{
@@ -2686,36 +2899,68 @@ app.post('/payment-requests',async(req,res)=>{
     const customerName=String(b.customer_name||'').trim();
     const purpose=String(b.purpose||'').trim();
     const amount=minor(b.amount);
-    const invoiceId=String(b.invoice_id||'').trim()||null;
+    const bookingId=String(b.booking_intake_id||'').trim()||null;
+    let invoiceId=String(b.invoice_id||'').trim()||null;
+    const paymentKind=['deposit','balance','part','full','other'].includes(String(b.payment_kind||''))?String(b.payment_kind):'other';
     if(!customerName) throw new Error('Customer name is required.');
     if(!purpose) throw new Error('Enter what the payment is for.');
     if(amount<=0) throw new Error('Enter a payment amount.');
 
+    if(bookingId){
+      const booking=(await client.query(`
+        SELECT b.*,i.outstanding_minor AS invoice_outstanding_minor,i.paid_minor AS invoice_paid_minor
+        FROM booking_intakes b
+        LEFT JOIN customer_invoices i ON i.id=b.invoice_id
+        WHERE b.id=$1 AND b.tenant_id=$2
+        FOR UPDATE OF b
+      `,[bookingId,tenant.id])).rows[0];
+      if(!booking || booking.status==='cancelled') throw new Error('Linked booking could not be found.');
+
+      if(booking.invoice_id){
+        if(invoiceId && String(invoiceId)!==String(booking.invoice_id)) throw new Error('The selected invoice does not belong to this booking.');
+        invoiceId=String(booking.invoice_id);
+      }
+
+      const sums=(await client.query(`
+        SELECT
+          COALESCE(SUM(amount_minor) FILTER (WHERE status='paid'),0)::bigint AS paid_minor,
+          COALESCE(SUM(amount_minor) FILTER (WHERE status='awaiting'),0)::bigint AS awaiting_minor
+        FROM payment_requests
+        WHERE booking_intake_id=$1 AND tenant_id=$2
+      `,[bookingId,tenant.id])).rows[0];
+      const paid=booking.invoice_id?Number(booking.invoice_paid_minor||0):Number(sums.paid_minor||0);
+      const remaining=booking.invoice_id?Math.max(0,Number(booking.invoice_outstanding_minor||0)):Math.max(0,Number(booking.agreed_price_minor||0)-paid);
+      const available=Math.max(0,remaining-Number(sums.awaiting_minor||0));
+      if(available<=0) throw new Error('This booking has no unallocated balance left to request.');
+      if(amount>available) throw new Error(`This request is ${euro(amount)} but the booking has only ${euro(available)} available to request.`);
+    }
+
     if(invoiceId){
       const i=(await client.query(`SELECT * FROM customer_invoices WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,[invoiceId,tenant.id])).rows[0];
-      if(!i || !i.locked_at) throw new Error('Linked invoice could not be found.');
+      if(!i) throw new Error('Linked invoice could not be found.');
+      if(!bookingId && !i.locked_at) throw new Error('Issue the invoice before creating a standalone invoice payment request.');
       if(amount>Number(i.outstanding_minor||0)) throw new Error(`The payment request cannot exceed the invoice balance of ${euro(i.outstanding_minor)}.`);
     }
 
     const token=crypto.randomBytes(24).toString('base64url');
     const inserted=(await client.query(`
       INSERT INTO payment_requests(
-        tenant_id,invoice_id,customer_name,customer_phone,customer_email,purpose,amount_minor,
+        tenant_id,invoice_id,booking_intake_id,payment_kind,customer_name,customer_phone,customer_email,purpose,amount_minor,
         currency_code,status,public_token,created_by
-      ) VALUES($1,$2,$3,$4,$5,$6,$7,'EUR','awaiting',$8,'Sotoboats Admin')
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'EUR','awaiting',$10,'Sotoboats Admin')
       RETURNING *
-    `,[tenant.id,invoiceId,customerName,String(b.customer_phone||'').trim()||null,String(b.customer_email||'').trim()||null,purpose,amount,token])).rows[0];
+    `,[tenant.id,invoiceId,bookingId,paymentKind,customerName,String(b.customer_phone||'').trim()||null,String(b.customer_email||'').trim()||null,purpose,amount,token])).rows[0];
 
     if(invoiceId){
       await client.query(`
         INSERT INTO customer_invoice_events(tenant_id,invoice_id,event_type,actor_name,details)
         VALUES($1,$2,'payment_request_created','Sotoboats Admin',
-          jsonb_build_object('payment_request_id',to_jsonb($3::text),'amount_minor',to_jsonb($4::bigint)))
-      `,[tenant.id,invoiceId,String(inserted.id),amount]);
+          jsonb_build_object('payment_request_id',to_jsonb($3::text),'amount_minor',to_jsonb($4::bigint),'booking_intake_id',to_jsonb($5::text)))
+      `,[tenant.id,invoiceId,String(inserted.id),amount,bookingId||'']);
     }
 
     await client.query('COMMIT');
-    res.redirect(`/payment-requests?created=${encodeURIComponent(paymentRequestReference(inserted))}`);
+    res.redirect(bookingId?`/bookings/${bookingId}`:`/payment-requests?created=${encodeURIComponent(paymentRequestReference(inserted))}`);
   }catch(err){
     try{await client.query('ROLLBACK');}catch(_){}
     res.status(400).send(shell('Payment request error','payment-requests',`<section class="card"><h2>Could not create payment request</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="javascript:history.back()">Go back</a></section>`));
@@ -2824,7 +3069,7 @@ app.post('/payment-requests/:id/paid',async(req,res)=>{
     `,[paidReference,invoicePaymentId,r.id]);
 
     await client.query('COMMIT');
-    res.redirect('/payment-requests');
+    res.redirect(r.booking_intake_id?`/bookings/${r.booking_intake_id}`:'/payment-requests');
   }catch(err){
     try{await client.query('ROLLBACK');}catch(_){}
     res.status(400).send(shell('Payment request error','payment-requests',`<section class="card"><h2>Could not mark payment as paid</h2><p class="sub">${esc(err.message)}</p><a class="btn light" href="/payment-requests">Back</a></section>`));
@@ -4090,7 +4335,9 @@ app.post('/invoices/:id/issue',async(req,res)=>{
 
     await client.query(`
       UPDATE customer_invoices SET
-        invoice_number=$1,issue_date=$2,due_date=$3,status='sent',issued_at=now(),locked_at=now(),updated_at=now(),
+        invoice_number=$1,issue_date=$2,due_date=$3,
+        status=CASE WHEN outstanding_minor<=0 THEN 'paid' WHEN paid_minor>0 THEN 'part_paid' ELSE 'sent' END,
+        issued_at=now(),locked_at=now(),updated_at=now(),
         snapshot_contact_name=$4,snapshot_company_name=$5,snapshot_email=$6,snapshot_phone=$7,
         snapshot_billing_address_1=$8,snapshot_billing_address_2=$9,snapshot_billing_city=$10,
         snapshot_billing_region=$11,snapshot_billing_postcode=$12,snapshot_billing_country_code=$13,
@@ -4999,6 +5246,8 @@ async function initialiseDatabase() {
       tenant_id UUID NOT NULL REFERENCES invoice_tenants(id) ON DELETE CASCADE,
       request_number BIGSERIAL UNIQUE,
       invoice_id UUID REFERENCES customer_invoices(id) ON DELETE SET NULL,
+      booking_intake_id UUID REFERENCES booking_intakes(id) ON DELETE SET NULL,
+      payment_kind TEXT NOT NULL DEFAULT 'other' CHECK (payment_kind IN ('deposit','balance','part','full','other')),
       customer_name TEXT NOT NULL,
       customer_phone TEXT,
       customer_email TEXT,
@@ -5027,6 +5276,8 @@ async function initialiseDatabase() {
       ON payment_requests(tenant_id,status,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_payment_requests_invoice
       ON payment_requests(invoice_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_payment_requests_booking
+      ON payment_requests(booking_intake_id,created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
       ON payment_requests(stripe_payment_intent_id)
       WHERE stripe_payment_intent_id IS NOT NULL;
@@ -5034,11 +5285,15 @@ async function initialiseDatabase() {
 
   await pool.query(`
     ALTER TABLE payment_requests
+      ADD COLUMN IF NOT EXISTS booking_intake_id UUID REFERENCES booking_intakes(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS payment_kind TEXT NOT NULL DEFAULT 'other',
       ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT,
       ADD COLUMN IF NOT EXISTS stripe_payment_status TEXT,
       ADD COLUMN IF NOT EXISTS stripe_charge_id TEXT,
       ADD COLUMN IF NOT EXISTS stripe_payment_method TEXT,
       ADD COLUMN IF NOT EXISTS stripe_paid_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_payment_requests_booking
+      ON payment_requests(booking_intake_id,created_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_requests_stripe_intent_unique
       ON payment_requests(stripe_payment_intent_id)
       WHERE stripe_payment_intent_id IS NOT NULL;
